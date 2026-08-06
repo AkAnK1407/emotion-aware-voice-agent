@@ -13,14 +13,14 @@ console.log("typeof module:", typeof module !== 'undefined' ? module : 'undefine
 console.log("typeof exports:", typeof exports !== 'undefined' ? exports : 'undefined');
 const LIVEKIT_URL = "wss://voice-agent-9u8rfie6.ohyderabad1a.production.livekit.cloud";
 
-// Backend (agent worker + dashboard WS + /token) hostname when deployed to
-// Render. Update this if you name your Render service something other than
-// "adaptivecx-agent" — the URL is always https://<service-name>.onrender.com.
-const RENDER_BACKEND_HOST = "adaptivecx-agent.onrender.com";
+// Backend (agent worker + dashboard WS + /token) hostname when not running
+// locally. Update this whenever you restart the Cloudflare Tunnel / redeploy
+// to Render — quick tunnels get a new random hostname each run.
+const BACKEND_HOST = "means-linear-efficient-discusses.trycloudflare.com";
 
 const IS_LOCAL = location.hostname === "localhost" || location.hostname === "127.0.0.1";
-const DASHBOARD_WS = IS_LOCAL ? "ws://localhost:8765" : `wss://${RENDER_BACKEND_HOST}/`;
-const TOKEN_URL = IS_LOCAL ? "http://localhost:7881/token" : `https://${RENDER_BACKEND_HOST}/token`;
+const DASHBOARD_WS = IS_LOCAL ? "ws://localhost:8765" : `wss://${BACKEND_HOST}/`;
+const TOKEN_URL = IS_LOCAL ? "http://localhost:7881/token" : `https://${BACKEND_HOST}/token`;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let room = null;

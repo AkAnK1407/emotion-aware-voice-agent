@@ -43,9 +43,6 @@ logger = logging.getLogger("dashboard_bridge")
 # Global set of connected browser clients
 _connected_clients: Set[ServerConnection] = set()
 
-LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "")
-LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "")
-
 # Localhost-only port used to relay broadcast events from a job subprocess
 # back into the process that owns the real WebSocket connections. Never
 # exposed externally — only the public WS/HTTP port above is.
@@ -57,11 +54,19 @@ def _b64url(data: bytes) -> str:
 
 
 def _make_token(room: str, identity: str) -> str:
-    """Mint a minimal LiveKit JWT token (same scheme as the old token_server.py)."""
+    """Mint a minimal LiveKit JWT token (same scheme as the old token_server.py).
+
+    Reads the API key/secret from the environment at call-time, not at import
+    time — this module is imported (and its top-level code executed) by
+    agent.py *before* agent.py's own `load_dotenv()` call runs, so caching
+    these in module-level constants would always see empty values.
+    """
+    api_key = os.getenv("LIVEKIT_API_KEY", "")
+    api_secret = os.getenv("LIVEKIT_API_SECRET", "")
     now = int(time.time())
     header = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
     payload = _b64url(json.dumps({
-        "iss": LIVEKIT_API_KEY,
+        "iss": api_key,
         "sub": identity,
         "iat": now,
         "exp": now + 3600,
@@ -75,7 +80,7 @@ def _make_token(room: str, identity: str) -> str:
         "name": identity,
     }).encode())
     sig_input = f"{header}.{payload}".encode()
-    sig = hmac.new(LIVEKIT_API_SECRET.encode(), sig_input, hashlib.sha256).digest()
+    sig = hmac.new(api_secret.encode(), sig_input, hashlib.sha256).digest()
     return f"{header}.{payload}.{_b64url(sig)}"
 
 
