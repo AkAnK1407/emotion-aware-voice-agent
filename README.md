@@ -1,4 +1,3 @@
-# EMOTIONALLY INTELLIGENT AI VOICE AGENT FOR CX TRANSFORMATIONS
 # AdaptiveCX — Emotional Voice Agent Demo
 ## Setup & Run Guide
 
