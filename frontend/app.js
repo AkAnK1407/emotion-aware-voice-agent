@@ -16,7 +16,7 @@ const LIVEKIT_URL = "wss://voice-agent-9u8rfie6.ohyderabad1a.production.livekit.
 // Backend (agent worker + dashboard WS + /token) hostname when not running
 // locally. Update this whenever you restart the Cloudflare Tunnel / redeploy
 // to Render — quick tunnels get a new random hostname each run.
-const BACKEND_HOST = "means-linear-efficient-discusses.trycloudflare.com";
+const BACKEND_HOST = "lancaster-smithsonian-powell-motel.trycloudflare.com";
 
 const IS_LOCAL = location.hostname === "localhost" || location.hostname === "127.0.0.1";
 const DASHBOARD_WS = IS_LOCAL ? "ws://localhost:8765" : `wss://${BACKEND_HOST}/`;
