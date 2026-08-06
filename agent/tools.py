@@ -19,12 +19,44 @@ functions passed to `Agent(tools=BANKING_TOOLS)` — the older
 was removed in the 1.0 API redesign.
 """
 
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from livekit.agents import function_tool
 
 import dashboard_bridge
+
+# Names + DOB that verify_identity accepts, all mapped onto the one seeded
+# demo account below — lets any teammate run the demo as themselves instead
+# of memorizing "Sarah Chen".
+_VALID_IDENTITIES = {
+    ("sarah chen", "1990-04-12"),
+    ("ritik", "2000-01-01"),
+    ("vanshika", "2000-01-01"),
+    ("akanksha", "2000-01-01"),
+    ("akash", "2000-01-01"),
+}
+
+_DOB_FORMATS = [
+    "%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y",
+    "%B %d, %Y", "%B %d %Y", "%d %B %Y", "%d %B, %Y",
+    "%b %d, %Y", "%b %d %Y", "%d %b %Y",
+]
+
+
+def _normalize_dob(raw: str) -> str:
+    """Best-effort normalize a spoken/typed DOB to YYYY-MM-DD, since Gemini
+    may pass back '2000-01-01', 'January 1, 2000', '1st January 2000', etc.
+    depending on how it was said — exact string matching alone is too
+    fragile for a voice interface."""
+    cleaned = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", raw.strip(), flags=re.IGNORECASE)
+    for fmt in _DOB_FORMATS:
+        try:
+            return datetime.strptime(cleaned, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return raw.strip()
 
 
 # ─── Mock Banking Data Store ─────────────────────────────────────────────────────
@@ -97,11 +129,12 @@ _store = _MockBankingStore()
 async def verify_identity(full_name: str, date_of_birth: str) -> str:
     """Verify the caller's identity before discussing account details or taking
     action on the account. Call this first for any account-specific request."""
-    match = (
-        full_name.strip().lower() == _store.customer.full_name.lower()
-        and date_of_birth.strip() == _store.customer.date_of_birth
-    )
+    match = (full_name.strip().lower(), _normalize_dob(date_of_birth)) in _VALID_IDENTITIES
     _store.customer.identity_verified = match
+    if match:
+        # Reflect whichever teammate actually verified, instead of always
+        # showing the original demo customer's name.
+        _store.customer.full_name = full_name.strip()
     result = (
         f"Identity VERIFIED for {full_name}." if match
         else "Identity verification FAILED — name or date of birth does not match our records."
