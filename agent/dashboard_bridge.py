@@ -8,6 +8,17 @@ This module also serves two plain-HTTP endpoints on the SAME port, via the
 frontend needs — no separate token server or health-check process required):
   • GET /health, GET /  (non-upgrade)  → 200 OK, for platform health checks
   • GET /token?room=&identity=          → mints a LiveKit JWT (was token_server.py)
+
+Process topology note: `start_server()` is started ONCE, at worker boot,
+before `cli.run_app()` (see the bottom of agent.py) — NOT inside `entrypoint()`.
+It must be reachable before any room/job exists, since a browser needs /token
+to even join the room that would trigger a job. But livekit-agents runs each
+job's `entrypoint_fnc` in its own subprocess, so code inside entrypoint() can't
+touch this module's `_connected_clients` directly — it lives in a different
+process. `broadcast()` therefore always forwards events over a localhost TCP
+bridge to the process actually running the WS server, which is the only place
+that ever touches `_connected_clients`. This works the same way whether the
+caller happens to be in-process or in a subprocess, so it's safe everywhere.
 """
 
 import asyncio
@@ -34,6 +45,11 @@ _connected_clients: Set[ServerConnection] = set()
 
 LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "")
 LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "")
+
+# Localhost-only port used to relay broadcast events from a job subprocess
+# back into the process that owns the real WebSocket connections. Never
+# exposed externally — only the public WS/HTTP port above is.
+_BRIDGE_PORT = int(os.getenv("DASHBOARD_BRIDGE_PORT", "8790"))
 
 
 def _b64url(data: bytes) -> str:
@@ -116,8 +132,10 @@ async def _handler(websocket: ServerConnection):
         logger.info(f"Dashboard client disconnected. Total: {len(_connected_clients)}")
 
 
-async def broadcast(event: dict):
-    """Broadcast an event dict to all connected browser clients."""
+async def _local_broadcast(event: dict):
+    """Actually pushes to connected WS clients. Only ever called from within
+    the process running start_server() — via the WS handler or the bridge
+    listener below, both on that process's single event loop."""
     if not _connected_clients:
         return
     message = json.dumps(event)
@@ -129,6 +147,44 @@ async def broadcast(event: dict):
             dead.add(ws)
     for ws in dead:
         _connected_clients.discard(ws)
+
+
+async def broadcast(event: dict):
+    """Broadcast an event dict to all connected browser clients.
+
+    Always forwards over the localhost TCP bridge, even if called from within
+    the same process that owns `_connected_clients` — that keeps this function
+    correct regardless of whether the caller is agent.py's job subprocess or
+    (in a future refactor) the same process, without needing to detect which.
+    """
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection("127.0.0.1", _BRIDGE_PORT), timeout=2.0
+        )
+        writer.write((json.dumps(event) + "\n").encode())
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+    except Exception as e:
+        logger.warning(f"[Bridge] failed to forward event to dashboard server: {e}")
+
+
+async def _bridge_tcp_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    """Receives events forwarded by `broadcast()` (possibly from a different
+    process) and pushes them to the real WS clients on this process's loop."""
+    try:
+        while True:
+            line = await reader.readline()
+            if not line:
+                break
+            try:
+                event = json.loads(line.decode())
+            except Exception as e:
+                logger.warning(f"[Bridge] malformed event: {e}")
+                continue
+            await _local_broadcast(event)
+    finally:
+        writer.close()
 
 
 async def broadcast_transcript(text: str, is_partial: bool = False, speaker: str = "customer"):
@@ -248,7 +304,10 @@ _server_started = False
 
 
 async def start_server(port: int = 8765, host: str = "0.0.0.0"):
-    """Start the combined WebSocket + HTTP (health/token) server. Call as an asyncio task."""
+    """Start the combined WebSocket + HTTP (health/token) server, plus the
+    internal localhost bridge listener that `broadcast()` calls target.
+    Must be started once, at worker process boot — see agent.py's
+    `if __name__ == "__main__"` block, not inside entrypoint()."""
     global _server_started
     if _server_started:
         logger.info(f"Dashboard server already running on port {port}")
@@ -256,11 +315,13 @@ async def start_server(port: int = 8765, host: str = "0.0.0.0"):
     _server_started = True
     logger.info(f"Dashboard WS + /token + /health server starting on {host}:{port}")
     try:
-        async with websockets.serve(_handler, host, port, process_request=_process_request):
+        bridge_server = await asyncio.start_server(_bridge_tcp_handler, "127.0.0.1", _BRIDGE_PORT)
+        logger.info(f"Dashboard bridge listener starting on 127.0.0.1:{_BRIDGE_PORT}")
+        async with bridge_server, websockets.serve(_handler, host, port, process_request=_process_request):
             await asyncio.Future()   # run forever
     except Exception as e:
         _server_started = False
-        logger.warning(f"Dashboard WebSocket server error: {e}")
+        logger.warning(f"Dashboard server error: {e}")
 
 
 if __name__ == "__main__":

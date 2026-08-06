@@ -301,13 +301,10 @@ async def entrypoint(ctx: JobContext):
     """
     logger.info("AdaptiveCX agent starting...")
 
-    # Start dashboard WebSocket server as background task.
-    # Cloud hosts (Render, etc.) assign the public port via $PORT; fall back to
-    # DASHBOARD_PORT/8765 for local dev. Must bind 0.0.0.0 to be reachable
-    # from outside the container, not just localhost.
-    dashboard_port = int(os.getenv("PORT", os.getenv("DASHBOARD_PORT", "8765")))
-    create_bg_task(dashboard_bridge.start_server(port=dashboard_port, host="0.0.0.0"))
-    logger.info(f"Dashboard server started on 0.0.0.0:{dashboard_port}")
+    # NOTE: the dashboard/token/health server is started once at process boot
+    # (see `if __name__ == "__main__"` below), not here — a browser needs
+    # /token to join the room that would even trigger this entrypoint, so it
+    # can't wait for a job to exist first.
 
     # Connect to LiveKit room
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
@@ -366,7 +363,24 @@ async def entrypoint(ctx: JobContext):
     await asyncio.sleep(float("inf"))
 
 
+def _start_dashboard_bridge_in_background():
+    """Runs the dashboard/token/health server on its own thread + event loop,
+    starting once when the worker process boots — before it's registered with
+    LiveKit Cloud and before any job can be dispatched. Must bind $PORT (cloud
+    hosts like Render assign this and forward it externally) so it's the first
+    thing listening, ahead of livekit-agents' own internal health-check port.
+    """
+    import threading
+
+    def _run():
+        dashboard_port = int(os.getenv("PORT", os.getenv("DASHBOARD_PORT", "8765")))
+        asyncio.run(dashboard_bridge.start_server(port=dashboard_port, host="0.0.0.0"))
+
+    threading.Thread(target=_run, name="dashboard-bridge", daemon=True).start()
+
+
 if __name__ == "__main__":
+    _start_dashboard_bridge_in_background()
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
