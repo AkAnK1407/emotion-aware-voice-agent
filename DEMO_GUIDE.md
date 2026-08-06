@@ -60,9 +60,9 @@ The demo customer is pre-seeded in `agent/tools.py`: **Sarah Chen**, account
 
 This is the point of the whole project: **`emotion_engine.detect()` runs on
 every single turn**, fresh, on whatever you just said — not once at the start
-of the call. `agent.py`'s `before_llm_callback` fires again each time you
-speak, re-reads only `chat_ctx.messages[-1]` (your newest line), and rebuilds
-the system prompt from scratch around that turn's emotion. So the same
+of the call. `AdaptiveCXAgent.on_user_turn_completed` (in `agent/agent.py`)
+fires again each time you speak, reads the message you just finished saying,
+and rebuilds the system prompt from scratch around that turn's emotion. So the same
 conversation should show the **emotion badge, stress meter, and policy banner
 changing turn-by-turn**, and the agent's tone should visibly follow it — not
 just the first line.
@@ -115,8 +115,8 @@ That's five different detected emotions and a falling stress / rising trust
 curve inside one uninterrupted conversation — point at the emotion badge,
 stress bar, and policy banner each time and note that nothing is reset
 between turns; every detection is independent and driven only by the line
-you just spoke (`before_llm_callback` re-runs `emotion_engine.detect()` on
-`chat_ctx.messages[-1]` fresh, every single turn — see `agent/agent.py`).
+you just spoke (`on_user_turn_completed` re-runs `emotion_engine.detect()`
+fresh, every single turn — see `agent/agent.py`).
 
 ### Bonus turns (optional, after the arc above)
 
@@ -220,9 +220,10 @@ signal in production for "what should the next KB article be."
 ## 4. Anticipated Q&A
 
 **"Is the LLM real, or is this scripted?"**
-Real Gemini 1.5 Flash call via its OpenAI-compatible endpoint
-(`agent/agent.py`, the `openai.LLM(...)` construction). Nothing is templated
-per emotion beyond the system prompt instructions.
+Real Gemini call via livekit-agents' native Google plugin
+(`agent/agent.py`, the `google.LLM(model="gemini-3.1-flash-lite", ...)`
+construction). Nothing is templated per emotion beyond the system prompt
+instructions.
 
 **"Is the tool-calling real function-calling, or are you just pattern-matching keywords?"**
 Real function-calling — the model receives structured function definitions
