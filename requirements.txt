@@ -41,7 +41,7 @@ numpy
 # =========================
 python-dotenv==1.0.1
 pydantic>=2.9
-httpx==0.27.2
+httpx>=0.28.1
 requests==2.32.3
 loguru==0.7.2
 aiofiles==24.1.0
