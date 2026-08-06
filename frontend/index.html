@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AdaptiveCX — Emotional Voice Agent Demo</title>
+  <meta name="description" content="Real-time emotionally intelligent AI voice agent. Watch emotion detection, stress analysis, and adaptive policy selection happen live." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<!-- ── HEADER ─────────────────────────────────────────────────────────────────── -->
+<header class="header">
+  <div class="header-left">
+    <div class="logo">
+      <span class="logo-icon">🧠</span>
+      <div>
+        <span class="logo-title">AdaptiveCX</span>
+        <span class="logo-subtitle">Emotional Voice Agent</span>
+      </div>
+    </div>
+  </div>
+  <div class="header-center">
+    <div class="status-pill" id="statusPill">
+      <span class="status-dot" id="statusDot"></span>
+      <span id="statusText">Connecting to agent...</span>
+    </div>
+  </div>
+  <div class="header-right">
+    <div class="turn-counter">
+      Turn <span id="turnCount">0</span>
+    </div>
+  </div>
+</header>
+
+<!-- ── MAIN LAYOUT ────────────────────────────────────────────────────────────── -->
+<main class="main">
+
+  <!-- LEFT PANEL: Emotion Intelligence ─────────────────────────────────────── -->
+  <section class="panel panel-left">
+
+    <!-- Emotion Badge -->
+    <div class="card emotion-card" id="emotionCard">
+      <div class="card-label">DETECTED EMOTION</div>
+      <div class="emotion-display">
+        <span class="emotion-emoji" id="emotionEmoji">😐</span>
+        <div class="emotion-info">
+          <div class="emotion-name" id="emotionName">NEUTRAL</div>
+          <div class="emotion-confidence">
+            Confidence: <span id="emotionConf">—</span>
+          </div>
+        </div>
+      </div>
+      <div class="emotion-bar-wrap">
+        <div class="emotion-bar" id="emotionBar"></div>
+      </div>
+    </div>
+
+    <!-- Stress Meter -->
+    <div class="card stress-card">
+      <div class="card-label">STRESS LEVEL</div>
+      <div class="metric-value" id="stressValue">0%</div>
+      <div class="bar-track">
+        <div class="bar-fill stress-fill" id="stressFill"></div>
+      </div>
+      <div class="bar-labels">
+        <span>Calm</span><span>Moderate</span><span>Critical</span>
+      </div>
+    </div>
+
+    <!-- Session Conversation State (Recency-Weighted) -->
+    <div class="card conv-state-card" id="convStateCard">
+      <div class="card-label">SESSION CONVERSATION STATE (70% RECENT)</div>
+      <div class="conv-display">
+        <div>
+          <div class="conv-score-title" id="convScoreValue">0.00</div>
+          <div class="conv-label-sub" id="convLabelSub">Neutral</div>
+        </div>
+        <div class="conv-badge" id="convTrendBadge">Stable ➔</div>
+      </div>
+      <div class="bar-track">
+        <div class="bar-fill conv-fill" id="convFill" style="width: 50%;"></div>
+      </div>
+    </div>
+
+    <!-- Trust Meter -->
+    <div class="card trust-card">
+      <div class="card-label">TRUST LEVEL</div>
+      <div class="metric-value" id="trustValue">0%</div>
+      <div class="bar-track">
+        <div class="bar-fill trust-fill" id="trustFill"></div>
+      </div>
+    </div>
+
+    <!-- Urgency + Patience -->
+    <div class="card metrics-row-card">
+      <div class="metric-box">
+        <div class="card-label">URGENCY</div>
+        <div class="mini-metric" id="urgencyValue">Low</div>
+        <div class="bar-track mini">
+          <div class="bar-fill urgency-fill" id="urgencyFill"></div>
+        </div>
+      </div>
+      <div class="metric-divider"></div>
+      <div class="metric-box">
+        <div class="card-label">PATIENCE</div>
+        <div class="mini-metric" id="patienceValue">High</div>
+        <div class="patience-pips" id="patiencePips">
+          <span class="pip active"></span>
+          <span class="pip active"></span>
+          <span class="pip active"></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Prosody Panel -->
+    <div class="card prosody-card">
+      <div class="card-label">PROSODY SIGNALS</div>
+      <div class="prosody-grid">
+        <div class="prosody-item">
+          <span class="prosody-icon">🗣️</span>
+          <span class="prosody-label">Words</span>
+          <span class="prosody-val" id="prosodyWords">—</span>
+        </div>
+        <div class="prosody-item">
+          <span class="prosody-icon">❗</span>
+          <span class="prosody-label">Exclamations</span>
+          <span class="prosody-val" id="prosodyExcl">—</span>
+        </div>
+        <div class="prosody-item">
+          <span class="prosody-icon">🔁</span>
+          <span class="prosody-label">Repetition</span>
+          <span class="prosody-val" id="prosodyRepeat">—</span>
+        </div>
+        <div class="prosody-item">
+          <span class="prosody-icon">🔊</span>
+          <span class="prosody-label">CAPS Ratio</span>
+          <span class="prosody-val" id="prosodyCaps">—</span>
+        </div>
+      </div>
+    </div>
+
+  </section>
+
+  <!-- CENTER PANEL: Conversation ────────────────────────────────────────────── -->
+  <section class="panel panel-center">
+
+    <!-- Policy Banner -->
+    <div class="policy-banner" id="policyBanner">
+      <div class="policy-icon">⚡</div>
+      <div class="policy-info">
+        <div class="policy-name" id="policyName">Waiting for input...</div>
+        <div class="policy-desc" id="policyDesc">Agent is ready to listen</div>
+      </div>
+      <div class="policy-tags">
+        <span class="tag" id="tagEmpathy">—</span>
+        <span class="tag" id="tagSpeed">—</span>
+        <span class="tag" id="tagEscalate" style="display:none">🔺 Escalate</span>
+      </div>
+    </div>
+
+    <!-- Conversation Timeline -->
+    <div class="conversation-wrap">
+      <div class="conv-header">
+        <span class="conv-title">📝 Live Conversation</span>
+        <button class="clear-btn" id="clearBtn">Clear</button>
+      </div>
+      <div class="conversation" id="conversation">
+        <div class="conv-placeholder">
+          Speak into your microphone to begin the demo.<br/>
+          The agent will respond with emotion-adaptive voice.
+        </div>
+      </div>
+    </div>
+
+    <!-- Join Room Controls -->
+    <div class="controls-wrap">
+      <div class="input-row">
+        <input
+          type="text"
+          id="roomInput"
+          class="room-input"
+          placeholder="LiveKit Room Name (e.g. adaptivecx-demo-room)"
+          value="adaptivecx-demo-room"
+        />
+        <button class="btn btn-primary" id="joinBtn">🎙️ Join Room</button>
+        <button class="btn btn-danger" id="leaveBtn" style="display:none">🔇 Leave</button>
+      </div>
+    </div>
+
+  </section>
+
+  <!-- RIGHT PANEL: Intelligence & Analytics ─────────────────────────────────── -->
+  <section class="panel panel-right">
+
+    <!-- Pipeline Visualizer -->
+    <div class="card pipeline-card">
+      <div class="card-label">PIPELINE STATUS</div>
+      <div class="pipeline">
+        <div class="pipe-step" id="step-stt">
+          <div class="pipe-icon">🎤</div>
+          <div class="pipe-name">Deepgram STT</div>
+          <div class="pipe-status">Ready</div>
+        </div>
+        <div class="pipe-arrow">↓</div>
+        <div class="pipe-step" id="step-behavior">
+          <div class="pipe-icon">🧠</div>
+          <div class="pipe-name">Behavior Engine</div>
+          <div class="pipe-status">Idle</div>
+        </div>
+        <div class="pipe-arrow">↓</div>
+        <div class="pipe-step" id="step-policy">
+          <div class="pipe-icon">⚖️</div>
+          <div class="pipe-name">Policy Engine</div>
+          <div class="pipe-status">Idle</div>
+        </div>
+        <div class="pipe-arrow">↓</div>
+        <div class="pipe-step" id="step-llm">
+          <div class="pipe-icon">💬</div>
+          <div class="pipe-name">Gemini LLM</div>
+          <div class="pipe-status">Idle</div>
+        </div>
+        <div class="pipe-arrow">↓</div>
+        <div class="pipe-step" id="step-tts">
+          <div class="pipe-icon">🔊</div>
+          <div class="pipe-name">Cartesia TTS</div>
+          <div class="pipe-status">Idle</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Emotion Timeline Chart -->
+    <div class="card chart-card">
+      <div class="card-label">EMOTION TIMELINE</div>
+      <div class="emotion-timeline" id="emotionTimeline">
+        <div class="timeline-placeholder">Emotion history will appear here...</div>
+      </div>
+    </div>
+
+    <!-- Problem Statement Card -->
+    <div class="card statement-card">
+      <div class="card-label">PROBLEM STATEMENT</div>
+      <p class="statement-text">
+        Traditional bots ignore <strong>how</strong> you feel.
+        AdaptiveCX detects your emotional state in real time and
+        dynamically adapts its strategy, response, and voice tone —
+        treating every customer as an individual human being.
+      </p>
+      <div class="feature-list">
+        <div class="feature">✅ Real-time emotion detection</div>
+        <div class="feature">✅ Stress &amp; prosody analysis</div>
+        <div class="feature">✅ Adaptive policy selection</div>
+        <div class="feature">✅ Gemini-powered responses</div>
+        <div class="feature">✅ Emotion-aware TTS voice</div>
+        <div class="feature">✅ Live dashboard visualization</div>
+      </div>
+    </div>
+
+  </section>
+
+  <!-- ENTERPRISE PANEL: Tools, Guardrails, Observability, Evaluation, Knowledge ── -->
+  <section class="panel panel-enterprise">
+
+    <!-- Agentic Tool Calls -->
+    <div class="card">
+      <div class="card-label">🛠️ AGENTIC TOOL CALLS</div>
+      <div class="tool-feed" id="toolFeed">
+        <div class="tool-placeholder">No tools called yet. Ask about a transaction or request a refund.</div>
+      </div>
+    </div>
+
+    <!-- Guardrails -->
+    <div class="card">
+      <div class="card-label">🛡️ GUARDRAILS</div>
+      <div class="badge-row">
+        <span class="badge-label">Input check</span>
+        <span class="badge badge-neutral" id="guardInputBadge">—</span>
+      </div>
+      <div class="badge-reason" id="guardInputReason">Waiting for input...</div>
+      <div class="badge-row">
+        <span class="badge-label">Output check</span>
+        <span class="badge badge-neutral" id="guardOutputBadge">—</span>
+      </div>
+      <div class="badge-reason" id="guardOutputReason">Waiting for response...</div>
+    </div>
+
+    <!-- Knowledge Retrieval -->
+    <div class="card">
+      <div class="card-label">📚 KNOWLEDGE RETRIEVAL</div>
+      <div class="badge-row">
+        <span class="badge-label">Status</span>
+        <span class="badge badge-neutral" id="kbBadge">—</span>
+      </div>
+      <div id="kbBody" class="kb-placeholder">No lookup yet.</div>
+    </div>
+
+    <!-- Per-Turn Evaluation -->
+    <div class="card">
+      <div class="card-label">✅ PER-TURN EVALUATION</div>
+      <div class="badge-row">
+        <span class="badge-label">Resolution signal</span>
+        <span class="badge badge-neutral" id="evalResolutionBadge">—</span>
+      </div>
+      <div class="badge-row">
+        <span class="badge-label">Predicted CSAT</span>
+        <span class="badge badge-neutral" id="evalCsatBadge">—</span>
+      </div>
+      <div class="badge-row">
+        <span class="badge-label">Policy compliance</span>
+        <span class="badge badge-neutral" id="evalComplianceBadge">—</span>
+      </div>
+      <div class="badge-reason" id="evalComplianceReason"></div>
+      <div class="badge-row">
+        <span class="badge-label">Hallucination flag</span>
+        <span class="badge badge-neutral" id="evalHallucinationBadge">—</span>
+      </div>
+      <div class="badge-reason" id="evalHallucinationReason"></div>
+    </div>
+
+    <!-- Observability -->
+    <div class="card">
+      <div class="card-label">📈 OBSERVABILITY — LATENCY &amp; COST</div>
+      <div class="obs-grid">
+        <div class="obs-item">
+          <div class="obs-stage">STT</div>
+          <div class="obs-latency" id="obsStt">—</div>
+        </div>
+        <div class="obs-item">
+          <div class="obs-stage">LLM (TTFT / total)</div>
+          <div class="obs-latency" id="obsLlm">—</div>
+        </div>
+        <div class="obs-item">
+          <div class="obs-stage">TTS (TTFB / total)</div>
+          <div class="obs-latency" id="obsTts">—</div>
+        </div>
+        <div class="obs-item">
+          <div class="obs-stage">Tokens (this turn)</div>
+          <div class="obs-latency" id="obsTokens">—</div>
+        </div>
+      </div>
+      <div class="obs-totals">
+        <span>Session: <b id="obsTotalTurns">0</b> turns</span>
+        <span>Est. cost: <b id="obsTotalCost">$0.0000</b></span>
+      </div>
+    </div>
+
+  </section>
+
+</main>
+
+<!-- ── SCRIPTS ─────────────────────────────────────────────────────────────────── -->
+<!-- Step 1: Load LiveKit UMD bundle (sets window.LivekitClient) -->
+<script src="livekit-client.umd.min.js"></script>
+<!-- Step 2: Confirm LiveKit loaded, then load app.js -->
+<script>
+  (function() {
+    var lk = window.LivekitClient || window.LiveKit;
+    if (!lk) {
+      console.error('[FATAL] LiveKit SDK did not load. window.LivekitClient =', window.LivekitClient);
+      document.addEventListener('DOMContentLoaded', function() {
+        var el = document.getElementById('statusText');
+        if (el) el.textContent = 'ERROR: LiveKit SDK failed to load. Check console.';
+      });
+    } else {
+      console.log('[OK] LiveKit SDK loaded. Room =', lk.Room);
+      // Ensure window.LiveKit is always set for app.js
+      window.LiveKit = lk;
+      window.LivekitClient = lk;
+    }
+  })();
+</script>
+<script src="app.js"></script>
+
+</body>
+</html>

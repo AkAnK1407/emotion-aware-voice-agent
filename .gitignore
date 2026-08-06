@@ -1,0 +1,14 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv312/
+.venv/
+venv/
+
+# Misc
+vc_redist.x64.exe
+scratch/
+*.log

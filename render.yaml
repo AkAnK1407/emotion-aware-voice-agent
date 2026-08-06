@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: adaptivecx-agent
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python agent/agent.py start
+    envVars:
+      - key: LIVEKIT_URL
+        sync: false
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
+      - key: DEEPGRAM_API_KEY
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: CARTESIA_API_KEY
+        sync: false
+      - key: AGENT_ROOM
+        sync: false

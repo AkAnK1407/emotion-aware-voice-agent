@@ -1,0 +1,47 @@
+# =========================
+# LiveKit Core
+# =========================
+# NOTE: 0.12.x (the "VoicePipelineAgent" API) is no longer usable with current
+# Gemini models — Gemini 2.5+/3.x require a "thought_signature" to be echoed
+# back on every multi-turn tool-calling round trip, and the 0.12.x plugin line
+# predates that requirement (every tool call's follow-up LLM call 400s).
+# Verified live; see agent/agent.py's GEMINI_MODEL comment for the model-name
+# side of this same issue.
+livekit>=1.1.0
+livekit-agents==1.6.8
+
+# =========================
+# LiveKit Plugins
+# =========================
+livekit-plugins-deepgram==1.6.8
+livekit-plugins-cartesia==1.6.8
+livekit-plugins-silero==1.6.8
+livekit-plugins-google==1.6.8
+
+# =========================
+# Gemini
+# =========================
+google-genai>=2.0.0
+
+# =========================
+# FastAPI
+# =========================
+fastapi==0.110.3
+uvicorn[standard]==0.30.6
+websockets>=14.0
+
+# =========================
+# ML / VAD
+# =========================
+onnxruntime==1.19.2
+numpy
+
+# =========================
+# Utilities
+# =========================
+python-dotenv==1.0.1
+pydantic>=2.9
+httpx==0.27.2
+requests==2.32.3
+loguru==0.7.2
+aiofiles==24.1.0
