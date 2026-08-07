@@ -16,7 +16,7 @@ const LIVEKIT_URL = "wss://voice-agent-9u8rfie6.ohyderabad1a.production.livekit.
 // Backend (agent worker + dashboard WS + /token) hostname when not running
 // locally. Update this whenever you restart the Cloudflare Tunnel / redeploy
 // to Render — quick tunnels get a new random hostname each run.
-const BACKEND_HOST = "lancaster-smithsonian-powell-motel.trycloudflare.com";
+const BACKEND_HOST = "belts-need-response-calculate.trycloudflare.com";
 
 const IS_LOCAL = location.hostname === "localhost" || location.hostname === "127.0.0.1";
 const DASHBOARD_WS = IS_LOCAL ? "ws://localhost:8765" : `wss://${BACKEND_HOST}/`;
@@ -484,6 +484,19 @@ function handleObservability(data) {
 
 // ── LiveKit Room Connection ───────────────────────────────────────────────────
 
+// Unique per browser tab/session, not shared across visitors. Without this,
+// everyone who opens the demo link joins as the same "dashboard-user"
+// identity, and LiveKit treats a second person's join as replacing the
+// first person's connection rather than adding a second participant.
+function getVisitorIdentity() {
+  let id = sessionStorage.getItem("adaptivecx-identity");
+  if (!id) {
+    id = "visitor-" + Math.random().toString(36).slice(2, 10);
+    sessionStorage.setItem("adaptivecx-identity", id);
+  }
+  return id;
+}
+
 async function joinRoom() {
   const roomName = roomInput.value.trim();
   if (!roomName) { alert("Please enter a room name"); return; }
@@ -496,7 +509,7 @@ async function joinRoom() {
     // For demo, we construct the room URL directly
     // You need a token — if you have a token server, replace this:
     const tokenResponse = await fetch(
-      `${TOKEN_URL}?room=${encodeURIComponent(roomName)}&identity=dashboard-user`
+      `${TOKEN_URL}?room=${encodeURIComponent(roomName)}&identity=${encodeURIComponent(getVisitorIdentity())}`
     ).catch(() => null);
 
     let token;
