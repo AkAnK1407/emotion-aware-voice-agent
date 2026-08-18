@@ -21,8 +21,8 @@ $venvPython  = "$root\.venv312\Scripts\python.exe"
 # voice-cx-server/. NOTE: if this instance is ever stopped and restarted
 # (not just rebooted), it gets a new public hostname/IP unless it has an
 # Elastic IP attached -- update this if the SSH tunnel below stops working.
-$voiceCxHost = "ec2-50-17-76-119.compute-1.amazonaws.com"
-$voiceCxKey  = "$root\keypair2.pem"
+$voiceCxHost = "ec2-3-80-80-136.compute-1.amazonaws.com"
+$voiceCxKey  = "$root\keypair3.pem"
 
 Write-Host "Stopping any existing instances..." -ForegroundColor Yellow
 Get-Process python      -ErrorAction SilentlyContinue | Stop-Process -Force
@@ -84,16 +84,23 @@ Write-Host "Clearing any stale demo room state..." -ForegroundColor Cyan
 Write-Host "Starting Cloudflare tunnels..." -ForegroundColor Cyan
 $backendLog  = "$env:TEMP\cf_backend.log"
 $frontendLog = "$env:TEMP\cf_frontend.log"
-Remove-Item $backendLog, $frontendLog -ErrorAction SilentlyContinue
+$authLog     = "$env:TEMP\cf_auth.log"
+Remove-Item $backendLog, $frontendLog, $authLog -ErrorAction SilentlyContinue
 
 Start-Process -FilePath $cloudflared -WindowStyle Hidden -ArgumentList `
     "tunnel","--url","http://localhost:8765","--logfile",$backendLog
 Start-Process -FilePath $cloudflared -WindowStyle Hidden -ArgumentList `
     "tunnel","--url","http://localhost:5500","--logfile",$frontendLog
+# Login/signup/history API (auth_server.py) -- separate service, separate
+# tunnel, since dashboard_bridge's server can't accept anything but a
+# bodyless GET (see auth_server.py's module docstring for why).
+Start-Process -FilePath $cloudflared -WindowStyle Hidden -ArgumentList `
+    "tunnel","--url","http://localhost:8766","--logfile",$authLog
 
 Write-Host "Waiting for tunnel URLs..." -ForegroundColor Cyan
 $backendUrl = $null
 $frontendUrl = $null
+$authUrl = $null
 for ($i = 0; $i -lt 30; $i++) {
     Start-Sleep -Seconds 1
     if (-not $backendUrl -and (Test-Path $backendLog)) {
@@ -104,16 +111,21 @@ for ($i = 0; $i -lt 30; $i++) {
         $m = Select-String -Path $frontendLog -Pattern "https://[a-z0-9-]+\.trycloudflare\.com" | Select-Object -First 1
         if ($m) { $frontendUrl = $m.Matches[0].Value }
     }
-    if ($backendUrl -and $frontendUrl) { break }
+    if (-not $authUrl -and (Test-Path $authLog)) {
+        $m = Select-String -Path $authLog -Pattern "https://[a-z0-9-]+\.trycloudflare\.com" | Select-Object -First 1
+        if ($m) { $authUrl = $m.Matches[0].Value }
+    }
+    if ($backendUrl -and $frontendUrl -and $authUrl) { break }
 }
 
-if (-not $backendUrl -or -not $frontendUrl) {
-    Write-Host "Could not detect tunnel URLs after 30s -- check $backendLog / $frontendLog manually." -ForegroundColor Red
+if (-not $backendUrl -or -not $frontendUrl -or -not $authUrl) {
+    Write-Host "Could not detect tunnel URLs after 30s -- check $backendLog / $frontendLog / $authLog manually." -ForegroundColor Red
     exit 1
 }
 
-Write-Host "Patching frontend/app.js with the new backend host..." -ForegroundColor Cyan
+Write-Host "Patching frontend/app.js with the new backend + auth hosts..." -ForegroundColor Cyan
 $backendHostOnly = $backendUrl -replace "https://", ""
+$authHostOnly = $authUrl -replace "https://", ""
 $appJsPath = "$root\frontend\app.js"
 # Read/write via .NET with an explicit no-BOM UTF8 encoding -- PowerShell's
 # own Get-Content/Set-Content -Encoding utf8 guesses the source encoding and
@@ -121,6 +133,7 @@ $appJsPath = "$root\frontend\app.js"
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $content = [System.IO.File]::ReadAllText($appJsPath, $utf8NoBom)
 $content = $content -replace 'const BACKEND_HOST = "[^"]*";', "const BACKEND_HOST = `"$backendHostOnly`";"
+$content = $content -replace 'const AUTH_HOST = "[^"]*";', "const AUTH_HOST = `"$authHostOnly`";"
 [System.IO.File]::WriteAllText($appJsPath, $content, $utf8NoBom)
 
 Write-Host ""
@@ -130,3 +143,4 @@ Write-Host " $frontendUrl" -ForegroundColor White
 Write-Host "================================================" -ForegroundColor Green
 Write-Host ""
 Write-Host "(backend: $backendUrl)" -ForegroundColor DarkGray
+Write-Host "(auth:    $authUrl)" -ForegroundColor DarkGray

@@ -16,11 +16,17 @@ const LIVEKIT_URL = "wss://voice-agent-9u8rfie6.ohyderabad1a.production.livekit.
 // Backend (agent worker + dashboard WS + /token) hostname when not running
 // locally. Update this whenever you restart the Cloudflare Tunnel / redeploy
 // to Render — quick tunnels get a new random hostname each run.
-const BACKEND_HOST = "pending-martial-applicant-mods.trycloudflare.com";
+const BACKEND_HOST = "tenant-incentives-procurement-memphis.trycloudflare.com";
+
+// Login/signup/history API (auth_server.py) — separate service, separate
+// tunnel, since dashboard_bridge's server can't accept anything but a
+// bodyless GET. Same "update after restarting the tunnel" caveat as above.
+const AUTH_HOST = "unlimited-knows-glance-creates.trycloudflare.com";
 
 const IS_LOCAL = location.hostname === "localhost" || location.hostname === "127.0.0.1";
 const DASHBOARD_WS = IS_LOCAL ? "ws://localhost:8765" : `wss://${BACKEND_HOST}/`;
 const TOKEN_URL = IS_LOCAL ? "http://localhost:7881/token" : `https://${BACKEND_HOST}/token`;
+const AUTH_URL = IS_LOCAL ? "http://localhost:8766" : `https://${AUTH_HOST}`;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let room = null;
@@ -28,6 +34,10 @@ let dashWs = null;
 let turnCount = 0;
 let emotionHistory = [];
 let isConnected = false;
+let interimBubbleEl = null;      // live "still speaking" bubble, replaced on final
+let lastCustomerBubbleEl = null; // most recent finalized customer bubble, awaiting its emotion tag
+let authSession = null;          // {token, user_id, display_name} once logged in, else null (guest)
+let authMode = "login";          // "login" | "signup" -- which tab is active in the auth card
 
 // ── DOM References ────────────────────────────────────────────────────────────
 const statusDot = document.getElementById("statusDot");
@@ -67,6 +77,7 @@ const voiceFrustrationValue = document.getElementById("voiceFrustrationValue");
 const voiceUrgencyValue = document.getElementById("voiceUrgencyValue");
 const voiceEscalationValue = document.getElementById("voiceEscalationValue");
 const voiceEmotionValue = document.getElementById("voiceEmotionValue");
+const behaviorSourceBadge = document.getElementById("behaviorSourceBadge");
 
 const convScoreValue = document.getElementById("convScoreValue");
 const convLabelSub = document.getElementById("convLabelSub");
@@ -108,6 +119,28 @@ const obsTts = document.getElementById("obsTts");
 const obsTokens = document.getElementById("obsTokens");
 const obsTotalTurns = document.getElementById("obsTotalTurns");
 const obsTotalCost = document.getElementById("obsTotalCost");
+
+// ── Auth / History DOM References ────────────────────────────────────────────
+const authOverlay = document.getElementById("authOverlay");
+const authForm = document.getElementById("authForm");
+const authError = document.getElementById("authError");
+const authUsername = document.getElementById("authUsername");
+const authDisplayName = document.getElementById("authDisplayName");
+const authPassword = document.getElementById("authPassword");
+const authSubmitBtn = document.getElementById("authSubmitBtn");
+const authCloseBtn = document.getElementById("authCloseBtn");
+const authGuestBtn = document.getElementById("authGuestBtn");
+const tabLogin = document.getElementById("tabLogin");
+const tabSignup = document.getElementById("tabSignup");
+
+const accountName = document.getElementById("accountName");
+const loginOpenBtn = document.getElementById("loginOpenBtn");
+const logoutBtn = document.getElementById("logoutBtn");
+const historyBtn = document.getElementById("historyBtn");
+const historyPanel = document.getElementById("historyPanel");
+const historyBackdrop = document.getElementById("historyBackdrop");
+const historyBody = document.getElementById("historyBody");
+const historyCloseBtn = document.getElementById("historyCloseBtn");
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -215,6 +248,50 @@ function addBubble(speaker, text, emotionTag, emotionColor) {
   wrap.appendChild(meta);
   conversation.appendChild(wrap);
   conversation.scrollTop = conversation.scrollHeight;
+  return wrap;
+}
+
+// Live "customer is speaking" preview, updated in place as interim STT
+// results arrive, then swapped for a real bubble once the turn is final —
+// this is what makes the transcript feel real-time instead of appearing
+// only once the (multi-second) emotion/policy pipeline finishes.
+function updateInterimBubble(text) {
+  if (!text || !text.trim()) return;
+  if (!interimBubbleEl) {
+    interimBubbleEl = addBubble("customer", text, null, null);
+    interimBubbleEl.classList.add("interim");
+  } else {
+    interimBubbleEl.querySelector(".bubble").textContent = text;
+  }
+  conversation.scrollTop = conversation.scrollHeight;
+}
+
+function finalizeCustomerBubble(text) {
+  if (interimBubbleEl) {
+    interimBubbleEl.classList.remove("interim");
+    interimBubbleEl.querySelector(".bubble").textContent = text;
+    lastCustomerBubbleEl = interimBubbleEl;
+    interimBubbleEl = null;
+  } else {
+    lastCustomerBubbleEl = addBubble("customer", text, null, null);
+  }
+}
+
+// Called once the "behavior" event lands (after emotion/policy analysis) --
+// paints the emotion tag onto the bubble that was already shown live.
+function tagLastCustomerBubble(emotionTag, emotionColor) {
+  if (!lastCustomerBubbleEl) return;
+  const meta = lastCustomerBubbleEl.querySelector(".bubble-meta");
+  if (!meta || meta.querySelector(".bubble-emotion-tag")) return;
+  const tag = document.createElement("span");
+  tag.className = "bubble-emotion-tag";
+  tag.style.background = emotionColor + "25";
+  tag.style.border = `1px solid ${emotionColor}50`;
+  tag.style.color = emotionColor;
+  tag.textContent = emotionTag;
+  meta.appendChild(tag);
+  lastCustomerBubbleEl = null;
+  conversation.scrollTop = conversation.scrollHeight;
 }
 
 function updateEmotionTimeline(emotion, color, confidence) {
@@ -285,10 +362,22 @@ function handleDashboardEvent(data) {
       break;
 
     case "behavior":
+      // ── Source badge: which path drove this turn's decision ───────────────
+      if (data.source === "voice") {
+        behaviorSourceBadge.textContent = "🎙️ VOICE (validated)";
+        behaviorSourceBadge.style.background = "rgba(34,197,94,0.15)";
+        behaviorSourceBadge.style.color = "#22c55e";
+      } else {
+        behaviorSourceBadge.textContent = "💬 TEXT (fallback)";
+        behaviorSourceBadge.style.background = "rgba(156,163,175,0.15)";
+        behaviorSourceBadge.style.color = "#9ca3af";
+      }
+
       // ── Update emotion ────────────────────────────────────────────────────
       emotionEmoji.textContent = data.emotion_emoji;
       emotionEmoji.classList.add("pop");
       setTimeout(() => emotionEmoji.classList.remove("pop"), 500);
+      tagLastCustomerBubble(data.emotion.toUpperCase(), data.emotion_color);
 
       emotionName.textContent = data.emotion.toUpperCase();
       emotionName.style.color = data.emotion_color;
@@ -373,10 +462,14 @@ function handleDashboardEvent(data) {
       break;
 
     case "transcript":
-      if (data.speaker === "customer" && !data.is_partial) {
-        const emotionLabel = emotionName.textContent;
-        const emotionClr = emotionCard.style.borderColor.replace("55", "");
-        addBubble("customer", data.text, emotionLabel, emotionClr || "#8b5cf6");
+      if (data.speaker === "customer") {
+        // Live as they speak: update in place, no emotion tag yet (that
+        // lands separately once the "behavior" event arrives).
+        if (data.is_partial) {
+          updateInterimBubble(data.text);
+        } else {
+          finalizeCustomerBubble(data.text);
+        }
       }
       break;
 
@@ -499,13 +592,175 @@ function handleObservability(data) {
   }
 }
 
+// ── Auth (login / signup / guest / history) ──────────────────────────────────
+// Optional by design: closing the card or clicking "Continue as guest" works
+// exactly like the demo did before this existed -- a random per-tab identity,
+// nothing persisted. Logging in swaps that for a stable "user-<id>" identity
+// so the agent (see agent.py:_resolve_session_user) can recognize the same
+// person across calls, skip re-verifying their identity, and this page can
+// show their past conversations.
+
+function loadAuthSession() {
+  try {
+    const raw = localStorage.getItem("adaptivecx-auth");
+    authSession = raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    authSession = null;
+  }
+}
+
+function saveAuthSession(session) {
+  authSession = session;
+  localStorage.setItem("adaptivecx-auth", JSON.stringify(session));
+}
+
+function clearAuthSession() {
+  authSession = null;
+  localStorage.removeItem("adaptivecx-auth");
+}
+
+function updateAccountUI() {
+  if (authSession) {
+    accountName.textContent = "👋 " + authSession.display_name;
+    accountName.style.display = "inline";
+    historyBtn.style.display = "inline-flex";
+    logoutBtn.style.display = "inline-flex";
+    loginOpenBtn.style.display = "none";
+  } else {
+    accountName.style.display = "none";
+    historyBtn.style.display = "none";
+    logoutBtn.style.display = "none";
+    loginOpenBtn.style.display = "inline-flex";
+  }
+}
+
+function setAuthMode(mode) {
+  authMode = mode;
+  tabLogin.classList.toggle("active", mode === "login");
+  tabSignup.classList.toggle("active", mode === "signup");
+  authDisplayName.style.display = mode === "signup" ? "block" : "none";
+  authSubmitBtn.textContent = mode === "signup" ? "Sign up" : "Log in";
+  authError.style.display = "none";
+}
+
+function openAuthOverlay() {
+  authError.style.display = "none";
+  authForm.reset();
+  authOverlay.classList.remove("hidden");
+  authUsername.focus();
+}
+
+function closeAuthOverlay() {
+  authOverlay.classList.add("hidden");
+  sessionStorage.setItem("adaptivecx-auth-dismissed", "1");
+}
+
+async function handleAuthSubmit(e) {
+  e.preventDefault();
+  authError.style.display = "none";
+  authSubmitBtn.disabled = true;
+  try {
+    const path = authMode === "signup" ? "/signup" : "/login";
+    const body = { username: authUsername.value.trim(), password: authPassword.value };
+    if (authMode === "signup") body.display_name = authDisplayName.value.trim();
+
+    const resp = await fetch(AUTH_URL + path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "Something went wrong.");
+
+    saveAuthSession({ token: data.token, user_id: data.user_id, display_name: data.display_name });
+    updateAccountUI();
+    closeAuthOverlay();
+    setStatus(
+      data.already_verified
+        ? `Welcome back, ${data.display_name} — your identity is already verified.`
+        : `Welcome, ${data.display_name}!`,
+      "connected"
+    );
+  } catch (err) {
+    authError.textContent = err.message || "Could not reach the auth server.";
+    authError.style.display = "block";
+  } finally {
+    authSubmitBtn.disabled = false;
+  }
+}
+
+function logout() {
+  clearAuthSession();
+  updateAccountUI();
+  closeHistoryPanel();
+}
+
+function formatHistoryTime(unixSeconds) {
+  return new Date(unixSeconds * 1000).toLocaleString([], {
+    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+  });
+}
+
+async function openHistoryPanel() {
+  if (!authSession) return;
+  historyPanel.classList.remove("hidden");
+  historyBackdrop.classList.remove("hidden");
+  historyBody.innerHTML = '<div class="history-placeholder">Loading…</div>';
+  try {
+    const resp = await fetch(AUTH_URL + "/history", {
+      headers: { "Authorization": "Bearer " + authSession.token },
+    });
+    if (!resp.ok) throw new Error("Could not load history.");
+    const data = await resp.json();
+    renderHistory(data.turns || []);
+  } catch (err) {
+    historyBody.innerHTML = `<div class="history-placeholder">${err.message}</div>`;
+  }
+}
+
+function closeHistoryPanel() {
+  historyPanel.classList.add("hidden");
+  historyBackdrop.classList.add("hidden");
+}
+
+function renderHistory(turns) {
+  if (!turns.length) {
+    historyBody.innerHTML = '<div class="history-placeholder">No conversations yet — start one!</div>';
+    return;
+  }
+  historyBody.innerHTML = "";
+  let lastRoom = null;
+  for (const t of turns) {
+    if (t.room !== lastRoom) {
+      const divider = document.createElement("div");
+      divider.className = "history-room-divider";
+      divider.textContent = t.room;
+      historyBody.appendChild(divider);
+      lastRoom = t.room;
+    }
+    const wrap = document.createElement("div");
+    wrap.className = "history-turn " + (t.speaker === "customer" ? "customer" : "agent");
+    wrap.innerHTML = `
+      <div class="h-speaker">${t.speaker === "customer" ? "You" : "AdaptiveCX"}</div>
+      <div class="h-text"></div>
+      <div class="h-time">${formatHistoryTime(t.created_at)}</div>
+    `;
+    wrap.querySelector(".h-text").textContent = t.text;
+    historyBody.appendChild(wrap);
+  }
+  historyBody.scrollTop = historyBody.scrollHeight;
+}
+
 // ── LiveKit Room Connection ───────────────────────────────────────────────────
 
-// Unique per browser tab/session, not shared across visitors. Without this,
-// everyone who opens the demo link joins as the same "dashboard-user"
-// identity, and LiveKit treats a second person's join as replacing the
-// first person's connection rather than adding a second participant.
+// Unique per browser tab/session for guests. Without this, everyone who
+// opens the demo link joins as the same identity, and LiveKit treats a
+// second person's join as replacing the first person's connection rather
+// than adding a second participant. Logged-in visitors get a stable
+// "user-<id>" identity instead (see the auth block above) so the agent can
+// recognize returning callers.
 function getVisitorIdentity() {
+  if (authSession && authSession.user_id) return "user-" + authSession.user_id;
   let id = sessionStorage.getItem("adaptivecx-identity");
   if (!id) {
     id = "visitor-" + Math.random().toString(36).slice(2, 10);
@@ -642,13 +897,34 @@ clearBtn.addEventListener("click", () => {
   turnCountEl.textContent = "0";
 });
 
+tabLogin.addEventListener("click", () => setAuthMode("login"));
+tabSignup.addEventListener("click", () => setAuthMode("signup"));
+authForm.addEventListener("submit", handleAuthSubmit);
+authCloseBtn.addEventListener("click", closeAuthOverlay);
+authGuestBtn.addEventListener("click", closeAuthOverlay);
+loginOpenBtn.addEventListener("click", openAuthOverlay);
+logoutBtn.addEventListener("click", logout);
+historyBtn.addEventListener("click", openHistoryPanel);
+historyCloseBtn.addEventListener("click", closeHistoryPanel);
+historyBackdrop.addEventListener("click", closeHistoryPanel);
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 // Connect to dashboard WebSocket immediately
 connectDashboard();
 
+// Auth: restore a saved session, or offer the login card once per tab
+// (declining/guest-ing is remembered for the rest of this tab so it
+// doesn't nag on every re-render).
+loadAuthSession();
+updateAccountUI();
+if (!authSession && !sessionStorage.getItem("adaptivecx-auth-dismissed")) {
+  openAuthOverlay();
+}
+
 // Show initial state
 setStatus("Connecting to agent...", "");
 console.log("AdaptiveCX Dashboard initialized");
 console.log("Dashboard WS:", DASHBOARD_WS);
+console.log("Auth URL:", AUTH_URL);
 console.log("LiveKit URL:", LIVEKIT_URL);

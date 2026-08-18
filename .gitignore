@@ -6,6 +6,11 @@ scratch/
 # SSH private keys for the EC2 voice-CX server -- never commit these.
 *.pem
 
+# Login/chat-history DB (agent/storage.py) -- local demo state, never commit.
+*.db
+*.db-wal
+*.db-shm
+
 # ── Byte-compiled / optimized / DLL files ──────────────────────────
 __pycache__/
 *.py[codz]

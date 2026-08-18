@@ -203,6 +203,7 @@ class VoiceCXModel:
         result = {t: float(self.stage2_models[t].predict(x)[0]) for t in CX_TARGETS}
         pred_idx = int(probs.argmax())
         result["emotion"] = self.emotion_classes[pred_idx]
+        result["emotion_confidence"] = float(probs[pred_idx])
         result["arousal"] = feat_row["arousal"]
         result["valence"] = feat_row["valence"]
         return result

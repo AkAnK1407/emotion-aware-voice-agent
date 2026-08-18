@@ -29,11 +29,48 @@
     </div>
   </div>
   <div class="header-right">
+    <div class="account-widget" id="accountWidget">
+      <span class="account-name" id="accountName" style="display:none;"></span>
+      <button class="btn-chip" id="historyBtn" style="display:none;">🕐 History</button>
+      <button class="btn-chip" id="loginOpenBtn">👤 Log in</button>
+      <button class="btn-chip" id="logoutBtn" style="display:none;">Log out</button>
+    </div>
     <div class="turn-counter">
       Turn <span id="turnCount">0</span>
     </div>
   </div>
 </header>
+
+<!-- ── AUTH OVERLAY (dismissible — guest mode always available) ──────────────────── -->
+<div class="auth-overlay hidden" id="authOverlay">
+  <div class="auth-card card">
+    <button class="auth-close" id="authCloseBtn" aria-label="Close">✕</button>
+    <div class="auth-tabs">
+      <button class="auth-tab active" id="tabLogin" type="button">Log in</button>
+      <button class="auth-tab" id="tabSignup" type="button">Sign up</button>
+    </div>
+    <form class="auth-body" id="authForm">
+      <div class="auth-error" id="authError" style="display:none;"></div>
+      <input class="room-input" id="authUsername" placeholder="Username" autocomplete="username" required />
+      <input class="room-input" id="authDisplayName" placeholder="Display name (optional)" style="display:none;" />
+      <input class="room-input" id="authPassword" type="password" placeholder="Password" autocomplete="current-password" required />
+      <button class="btn btn-primary" id="authSubmitBtn" type="submit" style="width:100%;">Log in</button>
+    </form>
+    <button class="auth-guest-link" id="authGuestBtn" type="button">Continue as guest →</button>
+  </div>
+</div>
+
+<!-- ── HISTORY PANEL ──────────────────────────────────────────────────────────────── -->
+<div class="history-backdrop hidden" id="historyBackdrop"></div>
+<div class="history-panel hidden" id="historyPanel">
+  <div class="history-header">
+    <span>🕐 Your Past Conversations</span>
+    <button class="auth-close" id="historyCloseBtn" aria-label="Close">✕</button>
+  </div>
+  <div class="history-body" id="historyBody">
+    <div class="history-placeholder">No conversations yet.</div>
+  </div>
+</div>
 
 <!-- ── MAIN LAYOUT ────────────────────────────────────────────────────────────── -->
 <main class="main">
@@ -43,7 +80,10 @@
 
     <!-- Emotion Badge -->
     <div class="card emotion-card" id="emotionCard">
-      <div class="card-label">DETECTED EMOTION</div>
+      <div class="card-label">
+        DETECTED EMOTION
+        <span id="behaviorSourceBadge" style="float:right; font-size:10px; font-weight:600; padding:2px 8px; border-radius:10px; background:rgba(255,255,255,0.08); color:#9ca3af;">—</span>
+      </div>
       <div class="emotion-display">
         <span class="emotion-emoji" id="emotionEmoji">😐</span>
         <div class="emotion-info">

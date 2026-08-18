@@ -27,6 +27,20 @@ def is_configured() -> bool:
     return bool(os.getenv("VOICE_CX_SERVER_URL", "").strip())
 
 
+def estimate_timeout(frames, base: float = 3.0, factor: float = 1.0,
+                      floor: float = 8.0, ceiling: float = 20.0) -> float:
+    """How long to wait for this turn's /predict call, scaled to how much
+    audio there actually is -- a fixed timeout was the bug: the EC2 server
+    runs inference at roughly realtime (plus SSH-tunnel network overhead),
+    so a fixed 12s cap silently discarded every turn longer than ~9-10s of
+    speech and fell back to text every time, even though the server itself
+    was healthy and responding. `base` covers upload + tunnel round-trip
+    for a near-empty clip; `factor` is seconds of wait per second of audio.
+    """
+    duration = sum(getattr(f, "duration", 0.0) for f in (frames or []))
+    return min(max(base + duration * factor, floor), ceiling)
+
+
 def _frames_to_wav_bytes(frames) -> bytes | None:
     if not frames:
         return None
@@ -43,7 +57,7 @@ def _frames_to_wav_bytes(frames) -> bytes | None:
     return buf.read()
 
 
-async def predict_from_frames(frames, timeout: float = 15.0) -> dict:
+async def predict_from_frames(frames, timeout: float = 20.0) -> dict:
     """Sends this turn's raw audio to the remote Voice CX server and returns
     its JSON result. Raises on any failure (unreachable server, timeout,
     non-2xx, no audio) -- callers must catch and treat as non-fatal, since

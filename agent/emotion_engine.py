@@ -7,6 +7,7 @@ optionally HuggingFace for higher accuracy.
 
 import math
 import re
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, Optional
@@ -153,20 +154,69 @@ NEGATIVE_WORDS = {
 class EmotionEngine:
     """
     Detects emotion from customer text using softmax over keyword scores.
-    Maintains session-level conversation state with recency weighting (70% current, 30% history).
+    Maintains session-level conversation state over a sliding window of the
+    last `window` turns (default 5): the current turn is weighted
+    `current_weight`, the rest of the window is averaged for the remaining
+    weight. Old turns fall out of the window entirely rather than lingering
+    at ever-smaller weight forever, so "how is this conversation going"
+    reflects what was actually just said, not the whole session history.
     """
 
-    def __init__(self, recency_weight: float = 0.70):
-        self.recency_weight = recency_weight       # Current message weight (70%)
-        self.history_weight = 1.0 - recency_weight # Previous messages weight (30%)
+    def __init__(self, window: int = 5, current_weight: float = 0.40):
+        self.window = window
+        self.current_weight = current_weight
         self.reset_session()
 
     def reset_session(self):
         """Reset conversation session history."""
         self.session_turns = 0
+        self.sentiment_history = deque(maxlen=self.window)
         self.conversation_score = 0.0
         self.previous_conversation_score = 0.0
         self.conversation_trend = "Stable ➔"
+
+    def update_conversation_state(self, sentiment: float):
+        """Applies the same sliding-window session tracking used by
+        detect() below, factored out so the Stage-1 voice-driven path in
+        agent.py can share one continuous conversation trend with the
+        text-driven path, regardless of which one drove any given turn.
+        Returns (conversation_score, conversation_trend, conversation_label).
+        """
+        prev_score = self.conversation_score
+        self.sentiment_history.append(sentiment)
+
+        history = list(self.sentiment_history)[:-1]  # up to (window - 1) prior turns
+        if history:
+            history_avg = sum(history) / len(history)
+            conv_score = self.current_weight * sentiment + (1 - self.current_weight) * history_avg
+        else:
+            conv_score = sentiment
+
+        if self.session_turns == 0:
+            trend = "Stable ➔"
+        else:
+            diff = conv_score - prev_score
+            if diff > 0.08:
+                trend = "Improving ↗"
+            elif diff < -0.08:
+                trend = "Worsening ↘"
+            else:
+                trend = "Stable ➔"
+
+        self.previous_conversation_score = prev_score
+        self.conversation_score = round(conv_score, 3)
+        self.session_turns += 1
+        self.conversation_trend = trend
+
+        if conv_score > 0.30:
+            label = "Positive"
+        elif conv_score < -0.30:
+            label = "Critical / Tense"
+        elif conv_score < -0.05:
+            label = "Slightly Negative"
+        else:
+            label = "Neutral"
+        return self.conversation_score, self.conversation_trend, label
 
     def _calculate_sentence_sentiment(self, emotion: Emotion, confidence: float, stress: float) -> float:
         """Map current emotion and stress to a numerical score between -1.0 and +1.0."""
@@ -340,32 +390,7 @@ class EmotionEngine:
 
         # Step 6: Session Recency Weighting (70% current sentence, 30% history)
         current_sentence_sentiment = self._calculate_sentence_sentiment(primary_emotion, confidence, stress)
-        if self.session_turns == 0:
-            conv_score = current_sentence_sentiment
-            trend = "Stable ➔"
-        else:
-            conv_score = (self.recency_weight * current_sentence_sentiment) + (self.history_weight * self.conversation_score)
-            diff = conv_score - self.conversation_score
-            if diff > 0.08:
-                trend = "Improving ↗"
-            elif diff < -0.08:
-                trend = "Worsening ↘"
-            else:
-                trend = "Stable ➔"
-
-        self.previous_conversation_score = self.conversation_score
-        self.conversation_score = round(conv_score, 3)
-        self.session_turns += 1
-        self.conversation_trend = trend
-
-        if conv_score > 0.30:
-            conv_label = "Positive"
-        elif conv_score < -0.30:
-            conv_label = "Critical / Tense"
-        elif conv_score < -0.05:
-            conv_label = "Slightly Negative"
-        else:
-            conv_label = "Neutral"
+        _, _, conv_label = self.update_conversation_state(current_sentence_sentiment)
 
         return BehaviorSignals(
             emotion=primary_emotion,

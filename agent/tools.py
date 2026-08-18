@@ -19,6 +19,7 @@ functions passed to `Agent(tools=BANKING_TOOLS)` — the older
 was removed in the 1.0 API redesign.
 """
 
+import calendar
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -26,6 +27,7 @@ from datetime import datetime, timedelta
 from livekit.agents import function_tool
 
 import dashboard_bridge
+import storage
 
 # Names + DOB that verify_identity accepts, all mapped onto the one seeded
 # demo account below — lets any teammate run the demo as themselves instead
@@ -45,17 +47,130 @@ _DOB_FORMATS = [
 ]
 
 
+_ONES = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
+    "eighteen": 18, "nineteen": 19,
+}
+_TENS = {
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+    "seventy": 70, "eighty": 80, "ninety": 90,
+}
+_DAY_ORDINALS = {
+    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6,
+    "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10, "eleventh": 11,
+    "twelfth": 12, "thirteenth": 13, "fourteenth": 14, "fifteenth": 15,
+    "sixteenth": 16, "seventeenth": 17, "eighteenth": 18, "nineteenth": 19,
+    "twentieth": 20, "thirtieth": 30,
+}
+_TENS_ORDINAL_PREFIX = {"twenty": 20, "thirty": 30}
+_ONES_ORDINAL_SUFFIX = {
+    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6,
+    "seventh": 7, "eighth": 8, "ninth": 9,
+}
+_MONTH_WORDS = {m.lower(): i for i, m in enumerate(calendar.month_name) if m}
+_MONTH_WORDS.update({m.lower(): i for i, m in enumerate(calendar.month_abbr) if m})
+
+
+def _spoken_day_to_digit(phrase: str) -> str | None:
+    """'first' -> '1', 'twenty-first' -> '21'. Also accepts cardinal number
+    words ('one', 'twenty one') since a customer might say the day either
+    way."""
+    words = [w for w in phrase.replace("-", " ").split() if w]
+    if len(words) == 1 and words[0] in _DAY_ORDINALS:
+        return str(_DAY_ORDINALS[words[0]])
+    if len(words) == 1 and words[0] in _ONES:
+        return str(_ONES[words[0]])
+    if len(words) == 2 and words[0] in _TENS_ORDINAL_PREFIX and words[1] in _ONES_ORDINAL_SUFFIX:
+        return str(_TENS_ORDINAL_PREFIX[words[0]] + _ONES_ORDINAL_SUFFIX[words[1]])
+    if len(words) == 2 and words[0] in _TENS and words[1] in _ONES:
+        return str(_TENS[words[0]] + _ONES[words[1]])
+    return None
+
+
+def _spoken_year_to_digit(phrase: str) -> str | None:
+    """'two thousand' -> '2000', 'two thousand and five' -> '2005',
+    'nineteen ninety two' -> '1992'. Covers the two ways people actually
+    say a year out loud."""
+    words = [w for w in phrase.replace("-", " ").split() if w and w != "and"]
+    if not words:
+        return None
+    if words[0] == "two" and len(words) >= 2 and words[1] == "thousand":
+        rest = words[2:]
+        if not rest:
+            return "2000"
+        if len(rest) == 1 and rest[0] in _ONES:
+            return str(2000 + _ONES[rest[0]])
+        if len(rest) == 2 and rest[0] in _TENS and rest[1] in _ONES:
+            return str(2000 + _TENS[rest[0]] + _ONES[rest[1]])
+        if len(rest) == 1 and rest[0] in _TENS:
+            return str(2000 + _TENS[rest[0]])
+        return None
+    if len(words) == 2 and words[0] in _ONES and 10 <= _ONES[words[0]] <= 19 and words[1] in _TENS:
+        return str(_ONES[words[0]] * 100 + _TENS[words[1]])
+    if (len(words) == 3 and words[0] in _ONES and 10 <= _ONES[words[0]] <= 19
+            and words[1] in _TENS and words[2] in _ONES):
+        return str(_ONES[words[0]] * 100 + _TENS[words[1]] + _ONES[words[2]])
+    return None
+
+
+def _spell_out_dob(raw: str) -> str:
+    """Converts a fully-or-partly spelled-out DOB ('first of January two
+    thousand', 'January first, two thousand') into digit form so the
+    strptime pass below can parse it. STT + a lightweight LLM won't always
+    normalize spoken numbers to digits before this tool is called -- a
+    voice interface hears '2000' as the words 'two thousand', not the
+    digits, and without this the customer's DOB just never matches no
+    matter how many times they repeat it."""
+    words = [w for w in re.sub(r"[,]", " ", raw.lower()).split() if w not in ("of", "the")]
+    month_idx = next((i for i, w in enumerate(words) if w in _MONTH_WORDS), None)
+    if month_idx is None:
+        return raw
+
+    month_word = words[month_idx]
+    before, after = words[:month_idx], words[month_idx + 1:]
+
+    def _digit(phrase_words, parser):
+        phrase = " ".join(phrase_words)
+        if not phrase:
+            return None
+        return phrase if phrase.strip(" -").isdigit() else parser(phrase)
+
+    if before:
+        # "first of January two thousand" -- day precedes the month.
+        day_digit = _digit(before, _spoken_day_to_digit)
+        year_digit = _digit(after, _spoken_year_to_digit)
+    else:
+        # "January first, two thousand" -- day follows the month; try every
+        # split of the remaining words since there's no fixed-length marker
+        # between the day phrase and the year phrase.
+        day_digit = year_digit = None
+        for k in range(1, len(after)):
+            d = _digit(after[:k], _spoken_day_to_digit)
+            y = _digit(after[k:], _spoken_year_to_digit)
+            if d is not None and y is not None:
+                day_digit, year_digit = d, y
+                break
+
+    if day_digit is None or year_digit is None:
+        return raw
+
+    return f"{month_word.capitalize()} {day_digit} {year_digit}"
+
+
 def _normalize_dob(raw: str) -> str:
     """Best-effort normalize a spoken/typed DOB to YYYY-MM-DD, since Gemini
-    may pass back '2000-01-01', 'January 1, 2000', '1st January 2000', etc.
-    depending on how it was said — exact string matching alone is too
-    fragile for a voice interface."""
+    may pass back '2000-01-01', 'January 1, 2000', '1st January 2000',
+    'first of January two thousand', etc. depending on how it was said --
+    exact string matching alone is too fragile for a voice interface."""
     cleaned = re.sub(r"(\d+)(st|nd|rd|th)", r"\1", raw.strip(), flags=re.IGNORECASE)
-    for fmt in _DOB_FORMATS:
-        try:
-            return datetime.strptime(cleaned, fmt).strftime("%Y-%m-%d")
-        except ValueError:
-            continue
+    for candidate in (cleaned, _spell_out_dob(cleaned)):
+        for fmt in _DOB_FORMATS:
+            try:
+                return datetime.strptime(candidate, fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                continue
     return raw.strip()
 
 
@@ -119,6 +234,41 @@ class _MockBankingStore:
 
 _store = _MockBankingStore()
 
+# Set once per call by agent.py:entrypoint after the joining LiveKit
+# participant's identity is resolved to a logged-in account (None for guest
+# sessions, which behave exactly as before -- nothing persisted).
+_current_user_id: int | None = None
+
+
+def set_current_user(user_id: int | None) -> None:
+    """Hydrates the mock CRM's identity_verified state from a prior
+    verification tied to this account, so a returning logged-in customer
+    never has to restate their name/DOB. Guest sessions (user_id=None) are
+    untouched."""
+    global _current_user_id
+    _current_user_id = user_id
+    if user_id is None:
+        return
+    prior = storage.get_verified_identity(user_id)
+    if prior is not None:
+        _store.customer.identity_verified = True
+        _store.customer.full_name = prior.full_name
+        _store.customer.date_of_birth = prior.date_of_birth
+
+
+def verified_customer_note() -> str:
+    """A one-line addition for the system prompt when this call already
+    started out verified (see set_current_user) -- tells Gemini not to
+    bother re-asking. Empty string otherwise, so build_system_prompt's
+    default behavior (unverified, ask normally) is unaffected."""
+    if _current_user_id is not None and _store.customer.identity_verified:
+        return (
+            f"\n\nThe caller is already verified as {_store.customer.full_name} from a "
+            f"previous call. Do not ask them to verify their identity again unless they "
+            f"explicitly want to switch accounts."
+        )
+    return ""
+
 
 # ─── Agentic Tool Definitions ─────────────────────────────────────────────────────
 # The function's docstring becomes the tool description the LLM sees, and its
@@ -129,12 +279,16 @@ _store = _MockBankingStore()
 async def verify_identity(full_name: str, date_of_birth: str) -> str:
     """Verify the caller's identity before discussing account details or taking
     action on the account. Call this first for any account-specific request."""
-    match = (full_name.strip().lower(), _normalize_dob(date_of_birth)) in _VALID_IDENTITIES
+    normalized_dob = _normalize_dob(date_of_birth)
+    match = (full_name.strip().lower(), normalized_dob) in _VALID_IDENTITIES
     _store.customer.identity_verified = match
     if match:
         # Reflect whichever teammate actually verified, instead of always
         # showing the original demo customer's name.
         _store.customer.full_name = full_name.strip()
+        if _current_user_id is not None:
+            # Logged-in caller -- remember this so next call skips re-asking.
+            storage.save_verified_identity(_current_user_id, full_name.strip(), normalized_dob)
     result = (
         f"Identity VERIFIED for {full_name}." if match
         else "Identity verification FAILED — name or date of birth does not match our records."

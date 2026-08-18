@@ -173,6 +173,30 @@ class PolicyEngine:
         best_policy_name = max(scores, key=scores.get)
         return POLICIES[best_policy_name]
 
+    def select_from_stage1(self, emotion: str, arousal: float, valence: float) -> Policy:
+        """
+        Policy selection driven only by Stage 1's voice-based outputs
+        (emotion, arousal, valence) -- each validated against real held-out
+        IEMOCAP test data (emotion: 95% accuracy; arousal: Pearson r=0.62;
+        valence: Pearson r=0.83 -- see adaptivecx-stage1/README.md).
+
+        Deliberately NOT the weighted-formula scoring in select() above --
+        that formula depends on stress/engagement/trust/urgency, which have
+        no validated source when driven by voice alone (synthesizing them
+        from arousal/valence would just be a new unproven formula one level
+        removed). Each branch below is directly justified by the emotion/
+        arousal/valence values themselves, not a combined score.
+        """
+        if emotion == "angry" and arousal > 0.5:
+            return POLICIES["ESCALATE"]          # acute distress
+        if emotion in ("angry", "sad"):
+            return POLICIES["HIGH_EMPATHY"]        # negative emotion
+        if emotion == "neutral" and valence < -0.15:
+            return POLICIES["CALM"]                 # classified neutral but leaning negative
+        if emotion == "happy":
+            return POLICIES["EFFICIENT"]
+        return POLICIES["BALANCED"]                  # neutral, non-negative valence
+
 
 # ─── Quick Test ──────────────────────────────────────────────────────────────────
 

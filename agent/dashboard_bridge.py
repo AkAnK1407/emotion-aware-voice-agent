@@ -202,10 +202,15 @@ async def broadcast_transcript(text: str, is_partial: bool = False, speaker: str
     })
 
 
-async def broadcast_behavior(behavior: BehaviorSignals, policy: Policy):
-    """Send full behavior + policy update to dashboard."""
+async def broadcast_behavior(behavior: BehaviorSignals, policy: Policy, source: str = "text"):
+    """Send full behavior + policy update to dashboard.
+
+    source: "voice" (Stage 1, validated) or "text" (formula fallback) --
+    which one actually drove this turn's policy decision.
+    """
     await broadcast({
         "type": "behavior",
+        "source": source,
         "emotion": behavior.emotion.value,
         "emotion_confidence": behavior.emotion_confidence,
         "emotion_color": behavior.emotion_color,

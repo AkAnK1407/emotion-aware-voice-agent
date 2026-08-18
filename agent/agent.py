@@ -22,6 +22,7 @@ import asyncio
 import dataclasses
 import logging
 import os
+import time
 from typing import AsyncIterable, Optional
 
 from dotenv import load_dotenv
@@ -42,9 +43,17 @@ import evaluation
 import guardrails
 import knowledge_base
 import observability
+import storage
 import tools
 import voice_cx_client
-from emotion_engine import EmotionEngine, BehaviorSignals
+from emotion_engine import (
+    EMOTION_COLORS,
+    EMOTION_EMOJI,
+    BehaviorSignals,
+    Emotion,
+    EmotionEngine,
+    ProsodyFeatures,
+)
 from policy_engine import PolicyEngine, Policy
 
 load_dotenv()
@@ -62,6 +71,26 @@ _turn_count: int = 0
 _tool_called_this_turn: bool = False
 _last_customer_text: str = ""
 
+# Set once per job in entrypoint() when the joining participant's identity
+# resolves to a logged-in account (frontend sends "user-<id>"); None for
+# guest sessions, which behave exactly as before -- nothing persisted.
+_session_user_id: Optional[int] = None
+_session_room_name: str = ""
+
+
+async def _log_chat_turn(speaker: str, text: str, emotion: Optional[str] = None, policy_name: Optional[str] = None):
+    """No-op for guest sessions (no logged-in account to attach history to).
+    Runs the sqlite write off-thread and fire-and-forget (via create_bg_task
+    at call sites) so a slow disk never adds latency to the live call."""
+    if _session_user_id is None or not text.strip():
+        return
+    try:
+        await asyncio.to_thread(
+            storage.save_chat_turn, _session_user_id, _session_room_name, speaker, text, emotion, policy_name
+        )
+    except Exception as e:
+        logger.warning(f"[History] failed to save chat turn: {e!r}")
+
 # NOTE on the LLM model name: Gemini 2.5+/3.x require a "thought_signature" to be
 # echoed back on any multi-turn tool-calling round trip. livekit-plugins-google's
 # `_requires_thought_signatures()` only recognizes explicit dated model names
@@ -70,6 +99,81 @@ _last_customer_text: str = ""
 # that requires it. Using the alias silently drops the signature and every
 # tool-calling turn 400s on its follow-up call. Verified live against the API.
 GEMINI_MODEL = "gemini-3.1-flash-lite"
+
+
+# ─── Stage 1 (voice) -> BehaviorSignals ─────────────────────────────────────────
+
+_STAGE1_EMOTION_MAP = {
+    "angry": Emotion.ANGRY,
+    "happy": Emotion.HAPPY,
+    "neutral": Emotion.NEUTRAL,
+    "sad": Emotion.SAD,
+}
+
+
+def _behavior_from_stage1(result: dict, text: str) -> BehaviorSignals:
+    """Builds a BehaviorSignals from Stage 1's voice-based output.
+
+    Only emotion/arousal/valence are real, validated Stage-1 outputs (95%
+    test accuracy on held-out IEMOCAP data for emotion; Pearson r=0.62 for
+    arousal, r=0.83 for valence -- see adaptivecx-stage1/README.md).
+
+    stress/trust below are direct linear rescales of arousal/valence
+    ([-1,1] -> [0,1]) so the existing dashboard bars have something real to
+    show -- NOT a new combined formula, and NOT used by
+    policy_engine.select_from_stage1(), which reads emotion/arousal/valence
+    directly. engagement/urgency/patience have no voice-based equivalent at
+    all and are left as neutral placeholders rather than fabricated -- the
+    dashboard's "source" badge (voice vs. text-fallback) tells a viewer
+    when that's the case.
+    """
+    arousal = result["arousal"]
+    valence = result["valence"]
+    confidence = result.get("emotion_confidence", 0.5)
+
+    # Stage 1 is a 4-class classifier (angry/happy/neutral/sad, IEMOCAP) --
+    # it has no "frustrated" class at all, so a mildly frustrated tone
+    # (negative but not full anger) always lands on "neutral" and never
+    # displays as frustration. policy_engine.select_from_stage1() already
+    # treats this exact case (neutral + negative valence) as CALM -- the
+    # frustration-appropriate policy -- using valence, Stage 1's own
+    # validated output (Pearson r=0.83). Relabeling the displayed emotion
+    # the same way just makes the badge match the policy that's already
+    # being chosen, instead of contradicting it. (Deliberately NOT using
+    # Stage 2's "frustration" score for this -- see
+    # adaptivecx-stage2/README.md: it's fit to a formula whose top feature
+    # is Stage 1's own angry-probability, not a validated ground truth, and
+    # isn't wired into BehaviorSignals yet.)
+    if result["emotion"] == "neutral" and valence < -0.15:
+        emo = Emotion.FRUSTRATED
+    else:
+        emo = _STAGE1_EMOTION_MAP.get(result["emotion"], Emotion.NEUTRAL)
+    stress_display = round((arousal + 1) / 2, 3)
+    trust_display = round((valence + 1) / 2, 3)
+
+    sentiment = emotion_engine._calculate_sentence_sentiment(emo, confidence, stress_display)
+    conv_score, conv_trend, conv_label = emotion_engine.update_conversation_state(sentiment)
+
+    return BehaviorSignals(
+        emotion=emo,
+        emotion_confidence=round(confidence, 3),
+        emotion_color=EMOTION_COLORS[emo],
+        emotion_emoji=EMOTION_EMOJI[emo],
+        stress=stress_display,
+        engagement=0.5,   # no voice-based equivalent -- not used in select_from_stage1
+        trust=trust_display,
+        urgency=0.5,      # no voice-based equivalent -- not used in select_from_stage1
+        conversation_score=conv_score,
+        conversation_trend=conv_trend,
+        conversation_label=conv_label,
+        patience="medium",  # no voice-based equivalent
+        prosody=ProsodyFeatures(
+            speech_rate_estimate=0.0, caps_ratio=0.0, exclamation_count=0,
+            question_count=0, word_count=len(text.split()), avg_word_length=0.0,
+            repetition_score=0.0, punctuation_density=0.0,
+        ),
+        text=text,
+    )
 
 
 # ─── System Prompt Builder ───────────────────────────────────────────────────────
@@ -96,6 +200,8 @@ You have tools available: verify_identity, lookup_customer_profile, check_recent
 process_refund, create_support_ticket. Use them instead of guessing account details — verify
 identity before discussing or acting on the account, then look up real data before stating any
 balance, transaction, or refund figure."""
+
+    base += tools.verified_customer_note()
 
     if injection_flagged:
         base += ("\n\nGUARDRAIL NOTICE: the customer's message matched a prompt-injection pattern. "
@@ -177,26 +283,44 @@ class AdaptiveCXAgent(Agent):
             instructions=build_system_prompt(None, None),
             tools=tools.BANKING_TOOLS,
         )
-        # Shadow-mode voice CX (Stage 1 + Stage 2): runs on a separate
-        # server (voice-cx-server/) reached over HTTP -- this process never
-        # loads torch/funasr itself. If VOICE_CX_SERVER_URL isn't set, or
-        # the server's unreachable, the dashboard panel just stays empty --
-        # never blocks or breaks the actual conversation.
+        # Voice CX (Stage 1 + Stage 2): runs on a separate server
+        # (voice-cx-server/) reached over HTTP -- this process never loads
+        # torch/funasr itself. Stage 1's emotion/arousal/valence is the
+        # primary driver of the turn's policy (see on_user_turn_completed);
+        # Stage 2 is still display-only. If VOICE_CX_SERVER_URL isn't set,
+        # the server's unreachable, or it doesn't answer within the
+        # timeout, the turn falls back to the text-based formula instead --
+        # the agent must never go silent because of this.
         #
         # Strictly one in-flight request at a time: on a resource-tight
         # machine, letting these pile up (one per turn, each taking several
         # seconds) competes for CPU/memory with the real conversation and
-        # can overwhelm the remote server too. If a turn completes while a
-        # previous voice-CX call is still running, that turn is just
-        # skipped for the shadow panel -- fine, since it's a display-only
-        # feature, not something anything else depends on.
+        # can overwhelm the remote server too. If a turn arrives while a
+        # previous voice-CX call is still running, that turn just falls
+        # back to text immediately rather than queuing.
         self._audio_buffer: list = []
         self._voice_cx_busy = False
 
+        # If our own wait_for gives up on a turn, the EC2 server's inference
+        # thread doesn't stop -- a synchronous `run_in_executor` call can't
+        # be cancelled from the client side once it's started, so the
+        # abandoned request keeps running and holds the server's own
+        # one-at-a-time busy lock (see voice-cx-server/main.py) long after
+        # we've moved on. Observed live: a timed-out turn is immediately
+        # followed by a 503 on the very next turn, because that lock is
+        # still held. Rather than burning another full timeout budget
+        # walking straight into that lock, skip attempting voice CX for a
+        # short cooldown after any failure and go straight to text --
+        # cheaper for the customer's latency and doesn't add load to a
+        # server that's already behind.
+        self._voice_cx_cooldown_until = 0.0
+
     async def stt_node(self, audio, model_settings):
         """Taps the raw audio stream (unchanged, passed straight through to
-        the real STT) so Stage 1/2 can run on the same audio the customer
-        actually spoke, for the shadow-mode dashboard panel."""
+        the real STT) so Stage 1 can run on the same audio the customer
+        actually spoke -- this is now the primary driver of the turn's
+        emotion/policy (see on_user_turn_completed), with Stage 2's output
+        also broadcast to the dashboard's experimental panel."""
         async def _tap():
             async for frame in audio:
                 try:
@@ -207,24 +331,6 @@ class AdaptiveCXAgent(Agent):
 
         async for event in Agent.default.stt_node(self, _tap(), model_settings):
             yield event
-
-    async def _run_voice_cx(self, frames: list):
-        """Shadow mode: sends this turn's raw audio to the remote Voice CX
-        server and broadcasts the result to the dashboard for comparison.
-        Any failure here is caught and logged -- never allowed to affect
-        the live conversation."""
-        self._voice_cx_busy = True
-        try:
-            result = await voice_cx_client.predict_from_frames(frames)
-            await dashboard_bridge.broadcast_voice_cx(result)
-            logger.info(
-                f"[VoiceCX] emotion={result['emotion']} stress={result['stress']:.2f} "
-                f"frustration={result['frustration']:.2f} urgency={result['urgency']:.2f}"
-            )
-        except Exception as e:
-            logger.warning(f"[VoiceCX] shadow-mode inference failed (non-fatal): {e}")
-        finally:
-            self._voice_cx_busy = False
 
     async def on_user_turn_completed(self, turn_ctx: ChatContext, new_message: ChatMessage) -> None:
         global _current_behavior, _current_policy, _turn_count, _tool_called_this_turn, _last_customer_text
@@ -238,14 +344,8 @@ class AdaptiveCXAgent(Agent):
         _tool_called_this_turn = False   # reset per-turn tool tracking for the evaluator
         logger.info(f"[Turn {_turn_count}] Analyzing: {last_user_text[:60]}...")
 
-        # Snapshot + reset this turn's raw audio for the shadow-mode voice CX
-        # model, then kick it off in the background -- never awaited here,
-        # so it can't add latency to the actual response.
+        # Snapshot + reset this turn's raw audio.
         turn_frames, self._audio_buffer = self._audio_buffer, []
-        if voice_cx_client.is_configured() and turn_frames and not self._voice_cx_busy:
-            create_bg_task(self._run_voice_cx(turn_frames))
-        elif self._voice_cx_busy:
-            logger.debug("[VoiceCX] skipping this turn -- previous analysis still in flight")
 
         # ── Layer 1: Input Guardrail ─────────────────────────────────────────────
         input_guard = guardrails.check_input(last_user_text)
@@ -253,22 +353,82 @@ class AdaptiveCXAgent(Agent):
         if input_guard.category != "clean":
             logger.warning(f"[Guardrail:input] {input_guard.category} flags={input_guard.flags}")
 
-        # ── Layer 2: Behavior Intelligence ──────────────────────────────────────
-        behavior = emotion_engine.detect(last_user_text)
-        _current_behavior = behavior
+        # ── Layer 2: Behavior Intelligence ────────────────────────────────────────
+        # Stage 1 (voice, validated against real IEMOCAP test data) is the
+        # primary signal. It's awaited with a timeout -- a real, felt
+        # latency cost on every turn, accepted deliberately because
+        # emotion_engine.py's text formula has no such validation behind it
+        # at all. Falls back to the text formula only if Stage 1 doesn't
+        # answer in time or the server's unreachable -- the agent must
+        # never go silent because of this.
+        #
+        # Timeout: audio-length-dependent (see voice_cx_client.estimate_timeout)
+        # -- inference on the EC2 server runs roughly realtime, plus network
+        # overhead through the SSH tunnel, so a fixed cap silently discarded
+        # every turn longer than ~9-10s of speech. Logs actual elapsed time
+        # (and the budget used) on every attempt so the real number is
+        # measured, not guessed at again.
+        behavior = None
+        policy = None
+        source = "text"
+        voice_cx_result = None
 
+        _vcx_now = time.monotonic()
+        if _vcx_now < self._voice_cx_cooldown_until:
+            logger.info(
+                f"[VoiceCX] skipping -- still in cooldown for "
+                f"{self._voice_cx_cooldown_until - _vcx_now:.1f}s after the last failure "
+                f"(server's likely still finishing that abandoned request), falling back to text"
+            )
+        elif voice_cx_client.is_configured() and turn_frames and not self._voice_cx_busy:
+            self._voice_cx_busy = True
+            _vcx_t0 = time.monotonic()
+            _vcx_timeout = voice_cx_client.estimate_timeout(turn_frames)
+            try:
+                voice_cx_result = await asyncio.wait_for(
+                    voice_cx_client.predict_from_frames(turn_frames, timeout=_vcx_timeout),
+                    timeout=_vcx_timeout,
+                )
+                logger.info(f"[VoiceCX] responded in {time.monotonic() - _vcx_t0:.2f}s (budget {_vcx_timeout:.1f}s)")
+            except Exception as e:
+                logger.info(
+                    f"[VoiceCX] not available this turn after {time.monotonic() - _vcx_t0:.2f}s "
+                    f"(budget {_vcx_timeout:.1f}s), falling back to text ({e!r})"
+                )
+                self._voice_cx_cooldown_until = time.monotonic() + 8.0
+            finally:
+                self._voice_cx_busy = False
+        elif self._voice_cx_busy:
+            logger.info("[VoiceCX] previous analysis still in flight, falling back to text this turn")
+
+        if voice_cx_result is not None:
+            behavior = _behavior_from_stage1(voice_cx_result, last_user_text)
+            policy = policy_engine.select_from_stage1(
+                voice_cx_result["emotion"], voice_cx_result["arousal"], voice_cx_result["valence"]
+            )
+            source = "voice"
+            # Also feeds the dashboard's "VOICE-BASED CX" experimental panel
+            # (Stage 2's stress/frustration/urgency/escalation_risk) -- still
+            # display-only, not used for the decision above.
+            await dashboard_bridge.broadcast_voice_cx(voice_cx_result)
+            logger.info(
+                f"[VoiceCX] driving this turn: emotion={voice_cx_result['emotion']} "
+                f"arousal={voice_cx_result['arousal']:.2f} valence={voice_cx_result['valence']:.2f}"
+            )
+        else:
+            behavior = emotion_engine.detect(last_user_text)
+            policy = policy_engine.select(behavior)
+
+        _current_behavior = behavior
+        _current_policy = policy
         logger.info(
-            f"[Emotion] {behavior.emotion_emoji} {behavior.emotion.value.upper()} "
+            f"[Emotion:{source}] {behavior.emotion_emoji} {behavior.emotion.value.upper()} "
             f"(conf={behavior.emotion_confidence:.2f}, stress={behavior.stress:.2f}, "
             f"trust={behavior.trust:.2f})"
         )
-
-        # ── Layer 3: Policy Engine ───────────────────────────────────────────────
-        policy = policy_engine.select(behavior)
-        _current_policy = policy
         logger.info(f"[Policy] ► {policy.name} — {policy.description[:50]}")
 
-        # ── Layer 3b: Knowledge Retrieval ────────────────────────────────────────
+        # ── Layer 3: Knowledge Retrieval ─────────────────────────────────────────
         knowledge = knowledge_base.retrieve(last_user_text)
         await dashboard_bridge.broadcast_knowledge(dataclasses.asdict(knowledge))
         if knowledge.knowledge_gap:
@@ -283,8 +443,9 @@ class AdaptiveCXAgent(Agent):
         await self.update_instructions(dynamic_system)
 
         # ── Broadcast to Dashboard ───────────────────────────────────────────────
-        await dashboard_bridge.broadcast_behavior(behavior, policy)
-        await dashboard_bridge.broadcast_transcript(last_user_text, is_partial=False, speaker="customer")
+        # (customer transcript itself already went out live -- see
+        # on_user_input_transcribed in entrypoint())
+        await dashboard_bridge.broadcast_behavior(behavior, policy, source=source)
 
         logger.info(f"[Dashboard] Broadcast sent for turn {_turn_count}")
 
@@ -309,6 +470,11 @@ class AdaptiveCXAgent(Agent):
             logger.info(f"[Agent Response] {final_text[:80]}...")
             await dashboard_bridge.broadcast_agent_response(final_text)
             await dashboard_bridge.broadcast_transcript(final_text, is_partial=False, speaker="agent")
+            create_bg_task(_log_chat_turn(
+                "agent", final_text,
+                emotion=_current_behavior.emotion.value if _current_behavior else None,
+                policy_name=_current_policy.name if _current_policy else None,
+            ))
 
             if _current_behavior is not None and _current_policy is not None:
                 eval_result = evaluation.evaluate_turn(
@@ -355,6 +521,44 @@ def prewarm(proc):
         logger.warning(f"[Prewarm] VAD load warning: {e}")
 
 
+def _user_id_from_identity(identity: str) -> Optional[int]:
+    """Guest visitors get a random 'visitor-xxxx' LiveKit identity (see
+    frontend/app.js:getVisitorIdentity) and are left as None -- exactly
+    today's behavior, nothing persisted. A logged-in visitor's identity is
+    the deterministic 'user-<id>' the frontend sends once they've signed
+    in; pull the id straight out of it, no extra round trip needed."""
+    if identity.startswith("user-"):
+        try:
+            return int(identity[len("user-"):])
+        except ValueError:
+            return None
+    return None
+
+
+async def _resolve_session_user(ctx: JobContext) -> Optional[int]:
+    for p in ctx.room.remote_participants.values():
+        uid = _user_id_from_identity(p.identity)
+        if uid is not None:
+            return uid
+    # The triggering participant usually has already joined by the time
+    # ctx.connect() returns, but don't assume guest on a race -- wait
+    # briefly for participant_connected before giving up.
+    fut: asyncio.Future = asyncio.get_event_loop().create_future()
+
+    def _on_connected(participant):
+        uid = _user_id_from_identity(participant.identity)
+        if uid is not None and not fut.done():
+            fut.set_result(uid)
+
+    ctx.room.on("participant_connected", _on_connected)
+    try:
+        return await asyncio.wait_for(fut, timeout=3.0)
+    except asyncio.TimeoutError:
+        return None
+    finally:
+        ctx.room.off("participant_connected", _on_connected)
+
+
 async def entrypoint(ctx: JobContext):
     """
     LiveKit agent entrypoint. Sets up the full pipeline:
@@ -369,6 +573,16 @@ async def entrypoint(ctx: JobContext):
 
     # Connect to LiveKit room
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+
+    global _session_user_id, _session_room_name
+    _session_room_name = ctx.room.name
+    _session_user_id = await _resolve_session_user(ctx)
+    tools.set_current_user(_session_user_id)
+    if _session_user_id is not None:
+        pre_verified = tools._store.customer.identity_verified
+        logger.info(f"[Auth] logged-in session, user_id={_session_user_id}, pre_verified={pre_verified}")
+    else:
+        logger.info("[Auth] guest session (no login) -- nothing will be persisted")
 
     _vad = None
     if hasattr(ctx, "proc") and hasattr(ctx.proc, "userdata"):
@@ -406,6 +620,21 @@ async def entrypoint(ctx: JobContext):
     @session.on("metrics_collected")
     def on_metrics_collected(ev):
         create_bg_task(observability.handle_metrics(ev.metrics))
+
+    # Push the customer's words to the dashboard the instant STT produces
+    # them -- interim (is_final=False) as they're still speaking, final the
+    # moment they stop. This fires independently of on_user_turn_completed's
+    # guardrail/emotion/policy/knowledge pipeline below, which can now take
+    # several seconds (up to the voice-CX budget) before it's done; waiting
+    # for that to finish before showing the transcript is what made the
+    # chat look like it only "printed with the answer."
+    @session.on("user_input_transcribed")
+    def on_user_input_transcribed(ev):
+        create_bg_task(dashboard_bridge.broadcast_transcript(
+            ev.transcript, is_partial=not ev.is_final, speaker="customer"
+        ))
+        if ev.is_final:
+            create_bg_task(_log_chat_turn("customer", ev.transcript))
 
     # Track whether a tool was actually invoked this turn (for the evaluator's
     # hallucination check)
@@ -445,8 +674,28 @@ def _start_dashboard_bridge_in_background():
     threading.Thread(target=_run, name="dashboard-bridge", daemon=True).start()
 
 
+def _start_auth_server_in_background():
+    """Runs the login/signup/history API (auth_server.py) on its own port +
+    thread, same pattern as the dashboard bridge above -- a separate real
+    HTTP service because dashboard_bridge's server can't accept anything
+    but a bodyless GET (see auth_server.py's module docstring)."""
+    import threading
+
+    import uvicorn
+
+    import auth_server
+
+    def _run():
+        storage.init_db()
+        auth_port = int(os.getenv("AUTH_PORT", "8766"))
+        uvicorn.run(auth_server.app, host="0.0.0.0", port=auth_port, log_level="info")
+
+    threading.Thread(target=_run, name="auth-server", daemon=True).start()
+
+
 if __name__ == "__main__":
     _start_dashboard_bridge_in_background()
+    _start_auth_server_in_background()
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
