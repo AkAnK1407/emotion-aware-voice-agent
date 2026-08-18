@@ -16,24 +16,29 @@ const LIVEKIT_URL = "wss://voice-agent-9u8rfie6.ohyderabad1a.production.livekit.
 // Backend (agent worker + dashboard WS + /token) hostname when not running
 // locally. Update this whenever you restart the Cloudflare Tunnel / redeploy
 // to Render — quick tunnels get a new random hostname each run.
-const BACKEND_HOST = "tenant-incentives-procurement-memphis.trycloudflare.com";
+const BACKEND_HOST = "suit-discount-downloadable-jefferson.trycloudflare.com";
 
 // Login/signup/history API (auth_server.py) — separate service, separate
 // tunnel, since dashboard_bridge's server can't accept anything but a
 // bodyless GET. Same "update after restarting the tunnel" caveat as above.
-const AUTH_HOST = "unlimited-knows-glance-creates.trycloudflare.com";
+const AUTH_HOST = "tuition-clothes-stewart-wheels.trycloudflare.com";
 
 const IS_LOCAL = location.hostname === "localhost" || location.hostname === "127.0.0.1";
 const DASHBOARD_WS = IS_LOCAL ? "ws://localhost:8765" : `wss://${BACKEND_HOST}/`;
 const TOKEN_URL = IS_LOCAL ? "http://localhost:7881/token" : `https://${BACKEND_HOST}/token`;
 const AUTH_URL = IS_LOCAL ? "http://localhost:8766" : `https://${AUTH_HOST}`;
 
-// ── Auto-Generate Unique Room per User ────────────────────────────────────────
+// ── Auto-Generate Unique Room per Tab/Session ─────────────────────────────────
+// sessionStorage (not localStorage) is scoped per browser tab, not per browser
+// profile -- localStorage is shared across every tab of the same browser, so
+// two tabs open to this page would get the same saved room ID and collide
+// into the same conversation. sessionStorage gives each tab its own room,
+// while still surviving reloads of that same tab.
 function getOrCreateUserId() {
-  let userId = localStorage.getItem("adaptivecx_user_id");
+  let userId = sessionStorage.getItem("adaptivecx_user_id");
   if (!userId) {
     userId = "user-" + Math.random().toString(36).substring(2, 9) + "-" + Date.now();
-    localStorage.setItem("adaptivecx_user_id", userId);
+    sessionStorage.setItem("adaptivecx_user_id", userId);
   }
   return userId;
 }
