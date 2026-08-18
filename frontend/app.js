@@ -28,6 +28,19 @@ const DASHBOARD_WS = IS_LOCAL ? "ws://localhost:8765" : `wss://${BACKEND_HOST}/`
 const TOKEN_URL = IS_LOCAL ? "http://localhost:7881/token" : `https://${BACKEND_HOST}/token`;
 const AUTH_URL = IS_LOCAL ? "http://localhost:8766" : `https://${AUTH_HOST}`;
 
+// ── Auto-Generate Unique Room per User ────────────────────────────────────────
+function getOrCreateUserId() {
+  let userId = localStorage.getItem("adaptivecx_user_id");
+  if (!userId) {
+    userId = "user-" + Math.random().toString(36).substring(2, 9) + "-" + Date.now();
+    localStorage.setItem("adaptivecx_user_id", userId);
+  }
+  return userId;
+}
+
+const CURRENT_USER_ID = getOrCreateUserId();
+const AUTO_ROOM_NAME = "room-" + CURRENT_USER_ID;
+
 // ── State ─────────────────────────────────────────────────────────────────────
 let room = null;
 let dashWs = null;
@@ -91,6 +104,13 @@ const joinBtn = document.getElementById("joinBtn");
 const leaveBtn = document.getElementById("leaveBtn");
 const roomInput = document.getElementById("roomInput");
 const emotionTimeline = document.getElementById("emotionTimeline");
+
+// ── Auto-Set User's Private Room ─────────────────────────────────────────────
+roomInput.value = AUTO_ROOM_NAME;
+roomInput.title = `Your private room: ${AUTO_ROOM_NAME}. Each browser tab gets its own chat.`;
+roomInput.readOnly = true;
+roomInput.style.cursor = "not-allowed";
+roomInput.style.opacity = "0.7";
 
 const pipeSteps = {
   stt: document.getElementById("step-stt"),
