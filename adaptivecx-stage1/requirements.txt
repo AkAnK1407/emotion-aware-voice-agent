@@ -1,0 +1,13 @@
+torch
+torchaudio
+funasr
+modelscope
+soundfile
+librosa
+scipy
+scikit-learn
+pandas
+numpy
+pyyaml
+matplotlib
+tqdm

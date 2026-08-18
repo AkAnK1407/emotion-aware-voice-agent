@@ -1,0 +1,17 @@
+# Matches the config used for the checkpoint in models/best_stage1.pt
+# (trained on Kaggle, see ../AdaptiveCX_Stage1_Kaggle.ipynb).
+model:
+  name: iic/emotion2vec_plus_base
+  freeze_backbone: true
+
+training:
+  batch_size: 8
+  learning_rate: 0.0001
+  epochs: 30
+  seed: 42
+  patience: 6
+
+loss:
+  emotion_weight: 1.0
+  arousal_weight: 1.0
+  valence_weight: 1.0

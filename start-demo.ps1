@@ -17,10 +17,51 @@ $root        = "C:\Users\hp\Desktop\agent v1\adaptivecx-demo"
 $cloudflared = "C:\Program Files (x86)\cloudflared\cloudflared.exe"
 $venvPython  = "$root\.venv312\Scripts\python.exe"
 
+# Voice CX server (Stage 1 + Stage 2, shadow mode) -- EC2 instance running
+# voice-cx-server/. NOTE: if this instance is ever stopped and restarted
+# (not just rebooted), it gets a new public hostname/IP unless it has an
+# Elastic IP attached -- update this if the SSH tunnel below stops working.
+$voiceCxHost = "ec2-50-17-76-119.compute-1.amazonaws.com"
+$voiceCxKey  = "$root\keypair2.pem"
+
 Write-Host "Stopping any existing instances..." -ForegroundColor Yellow
 Get-Process python      -ErrorAction SilentlyContinue | Stop-Process -Force
 Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
+Get-CimInstance Win32_Process -Filter "Name='ssh.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -like "*8000:localhost:8000*" } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Seconds 2
+
+Write-Host "Starting voice-CX SSH tunnel (shadow mode, non-critical)..." -ForegroundColor Cyan
+# Fire-and-forget Start-Process doesn't confirm the tunnel actually stayed up
+# -- on a resource-tight machine it can spawn and die within a second or two
+# (observed under memory pressure while other processes are also starting).
+# So verify with a health check and retry a couple of times before giving up.
+$voiceCxUp = $false
+for ($attempt = 1; $attempt -le 3; $attempt++) {
+    try {
+        Start-Process -FilePath "ssh" -WindowStyle Hidden -ArgumentList @(
+            "-i", $voiceCxKey, "-N", "-L", "8000:localhost:8000",
+            "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=30",
+            "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10",
+            "ubuntu@$voiceCxHost"
+        )
+    } catch {
+        Write-Host "  attempt ${attempt}: Start-Process threw ($_)" -ForegroundColor DarkYellow
+    }
+    Start-Sleep -Seconds 3
+    try {
+        $health = Invoke-RestMethod -Uri "http://localhost:8000/health" -TimeoutSec 3 -ErrorAction Stop
+        if ($health.status -eq "ok") { $voiceCxUp = $true; break }
+    } catch {
+        Write-Host "  attempt ${attempt}: tunnel not up yet, retrying..." -ForegroundColor DarkYellow
+    }
+}
+if ($voiceCxUp) {
+    Write-Host "  voice-CX tunnel confirmed up." -ForegroundColor Green
+} else {
+    Write-Host "  voice-CX tunnel failed after 3 attempts -- dashboard panel will just stay empty, rest of the demo is unaffected." -ForegroundColor DarkYellow
+}
 
 $agentLog    = "$env:TEMP\agent_worker.log"
 $frontendSrvLog = "$env:TEMP\frontend_server.log"

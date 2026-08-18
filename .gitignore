@@ -3,6 +3,9 @@
 vc_redist.x64.exe
 scratch/
 
+# SSH private keys for the EC2 voice-CX server -- never commit these.
+*.pem
+
 # ── Byte-compiled / optimized / DLL files ──────────────────────────
 __pycache__/
 *.py[codz]

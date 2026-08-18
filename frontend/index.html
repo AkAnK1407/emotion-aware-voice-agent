@@ -142,6 +142,36 @@
       </div>
     </div>
 
+    <!-- Voice-Based CX (Stage 1 + Stage 2, shadow mode / experimental) -->
+    <div class="card" id="voiceCxCard">
+      <div class="card-label">VOICE-BASED CX (experimental, shadow mode)</div>
+      <div class="prosody-grid">
+        <div class="prosody-item">
+          <span class="prosody-icon">😣</span>
+          <span class="prosody-label">Stress</span>
+          <span class="prosody-val" id="voiceStressValue">—</span>
+        </div>
+        <div class="prosody-item">
+          <span class="prosody-icon">😤</span>
+          <span class="prosody-label">Frustration</span>
+          <span class="prosody-val" id="voiceFrustrationValue">—</span>
+        </div>
+        <div class="prosody-item">
+          <span class="prosody-icon">⏱️</span>
+          <span class="prosody-label">Urgency</span>
+          <span class="prosody-val" id="voiceUrgencyValue">—</span>
+        </div>
+        <div class="prosody-item">
+          <span class="prosody-icon">🔺</span>
+          <span class="prosody-label">Escalation</span>
+          <span class="prosody-val" id="voiceEscalationValue">—</span>
+        </div>
+      </div>
+      <div style="margin-top:8px; font-size:11px; color:#9ca3af;">
+        Voice emotion: <span id="voiceEmotionValue">—</span> — computed from audio only (Stage 1 + Stage 2 models), shown for comparison. Not used for the agent's actual response.
+      </div>
+    </div>
+
   </section>
 
   <!-- CENTER PANEL: Conversation ────────────────────────────────────────────── -->

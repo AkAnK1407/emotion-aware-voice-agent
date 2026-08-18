@@ -297,6 +297,16 @@ async def broadcast_evaluation(evaluation: dict):
     })
 
 
+async def broadcast_voice_cx(result: dict):
+    """Send the voice-based (Stage 1 + Stage 2) customer-state estimate to the
+    dashboard. Shadow mode: for side-by-side comparison only -- does not
+    drive the agent's actual response strategy."""
+    await broadcast({
+        "type": "voice_cx",
+        **result,
+    })
+
+
 async def broadcast_knowledge(knowledge: dict):
     """Send the knowledge-base retrieval result (or knowledge-gap flag) to the dashboard."""
     await broadcast({

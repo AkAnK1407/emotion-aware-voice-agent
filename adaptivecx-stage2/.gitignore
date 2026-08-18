@@ -1,0 +1,7 @@
+# Funasr's raw per-file inference dump (npy/json side-outputs), cached
+# locally during ad-hoc testing -- not reproducible from git and not needed.
+data/processed/_live_funasr_out/
+data/processed/_funasr_out/
+
+__pycache__/
+*.pyc

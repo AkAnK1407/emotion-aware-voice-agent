@@ -16,7 +16,7 @@ const LIVEKIT_URL = "wss://voice-agent-9u8rfie6.ohyderabad1a.production.livekit.
 // Backend (agent worker + dashboard WS + /token) hostname when not running
 // locally. Update this whenever you restart the Cloudflare Tunnel / redeploy
 // to Render — quick tunnels get a new random hostname each run.
-const BACKEND_HOST = "belts-need-response-calculate.trycloudflare.com";
+const BACKEND_HOST = "pending-martial-applicant-mods.trycloudflare.com";
 
 const IS_LOCAL = location.hostname === "localhost" || location.hostname === "127.0.0.1";
 const DASHBOARD_WS = IS_LOCAL ? "ws://localhost:8765" : `wss://${BACKEND_HOST}/`;
@@ -61,6 +61,12 @@ const prosodyWords = document.getElementById("prosodyWords");
 const prosodyExcl = document.getElementById("prosodyExcl");
 const prosodyRepeat = document.getElementById("prosodyRepeat");
 const prosodyCaps = document.getElementById("prosodyCaps");
+
+const voiceStressValue = document.getElementById("voiceStressValue");
+const voiceFrustrationValue = document.getElementById("voiceFrustrationValue");
+const voiceUrgencyValue = document.getElementById("voiceUrgencyValue");
+const voiceEscalationValue = document.getElementById("voiceEscalationValue");
+const voiceEmotionValue = document.getElementById("voiceEmotionValue");
 
 const convScoreValue = document.getElementById("convScoreValue");
 const convLabelSub = document.getElementById("convLabelSub");
@@ -402,6 +408,17 @@ function handleDashboardEvent(data) {
     case "observability_totals":
       obsTotalTurns.textContent = data.turns;
       obsTotalCost.textContent = "$" + data.estimated_cost_usd.toFixed(4);
+      break;
+
+    case "voice_cx":
+      // Experimental / shadow mode: voice-only signal (Stage 1 + Stage 2),
+      // shown for comparison against the text-based cards above it. Never
+      // drives the agent's actual response.
+      voiceStressValue.textContent = pct(data.stress);
+      voiceFrustrationValue.textContent = pct(data.frustration);
+      voiceUrgencyValue.textContent = pct(data.urgency);
+      voiceEscalationValue.textContent = pct(data.escalation_risk);
+      voiceEmotionValue.textContent = (data.emotion || "—").toUpperCase();
       break;
   }
 }

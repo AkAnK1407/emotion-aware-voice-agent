@@ -1,0 +1,20 @@
+# Local venv (not the training environment -- that's Kaggle)
+.venv/
+
+# Raw/processed audio and cached embeddings are large and not reproducible
+# from git alone; regenerate via scripts/prepare_data.py against a local
+# IEMOCAP copy, or re-run the Kaggle notebook.
+data/raw/
+data/processed/
+
+# Funasr's raw per-file inference dump (npy/json side-outputs)
+**/_funasr_raw_out/
+
+# Redundant raw Kaggle download folder -- its contents are already copied
+# into models/, results/, data/metadata/ above (and it includes a 376MB
+# Stage B checkpoint that was intentionally not carried into the clean
+# structure -- see README.md's "Stage B" section).
+adaptivecx_stage1_results (1)/
+
+__pycache__/
+*.pyc

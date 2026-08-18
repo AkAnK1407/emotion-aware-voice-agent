@@ -43,6 +43,7 @@ import guardrails
 import knowledge_base
 import observability
 import tools
+import voice_cx_client
 from emotion_engine import EmotionEngine, BehaviorSignals
 from policy_engine import PolicyEngine, Policy
 
@@ -176,6 +177,54 @@ class AdaptiveCXAgent(Agent):
             instructions=build_system_prompt(None, None),
             tools=tools.BANKING_TOOLS,
         )
+        # Shadow-mode voice CX (Stage 1 + Stage 2): runs on a separate
+        # server (voice-cx-server/) reached over HTTP -- this process never
+        # loads torch/funasr itself. If VOICE_CX_SERVER_URL isn't set, or
+        # the server's unreachable, the dashboard panel just stays empty --
+        # never blocks or breaks the actual conversation.
+        #
+        # Strictly one in-flight request at a time: on a resource-tight
+        # machine, letting these pile up (one per turn, each taking several
+        # seconds) competes for CPU/memory with the real conversation and
+        # can overwhelm the remote server too. If a turn completes while a
+        # previous voice-CX call is still running, that turn is just
+        # skipped for the shadow panel -- fine, since it's a display-only
+        # feature, not something anything else depends on.
+        self._audio_buffer: list = []
+        self._voice_cx_busy = False
+
+    async def stt_node(self, audio, model_settings):
+        """Taps the raw audio stream (unchanged, passed straight through to
+        the real STT) so Stage 1/2 can run on the same audio the customer
+        actually spoke, for the shadow-mode dashboard panel."""
+        async def _tap():
+            async for frame in audio:
+                try:
+                    self._audio_buffer.append(frame)
+                except Exception:
+                    pass
+                yield frame
+
+        async for event in Agent.default.stt_node(self, _tap(), model_settings):
+            yield event
+
+    async def _run_voice_cx(self, frames: list):
+        """Shadow mode: sends this turn's raw audio to the remote Voice CX
+        server and broadcasts the result to the dashboard for comparison.
+        Any failure here is caught and logged -- never allowed to affect
+        the live conversation."""
+        self._voice_cx_busy = True
+        try:
+            result = await voice_cx_client.predict_from_frames(frames)
+            await dashboard_bridge.broadcast_voice_cx(result)
+            logger.info(
+                f"[VoiceCX] emotion={result['emotion']} stress={result['stress']:.2f} "
+                f"frustration={result['frustration']:.2f} urgency={result['urgency']:.2f}"
+            )
+        except Exception as e:
+            logger.warning(f"[VoiceCX] shadow-mode inference failed (non-fatal): {e}")
+        finally:
+            self._voice_cx_busy = False
 
     async def on_user_turn_completed(self, turn_ctx: ChatContext, new_message: ChatMessage) -> None:
         global _current_behavior, _current_policy, _turn_count, _tool_called_this_turn, _last_customer_text
@@ -188,6 +237,15 @@ class AdaptiveCXAgent(Agent):
         _last_customer_text = last_user_text
         _tool_called_this_turn = False   # reset per-turn tool tracking for the evaluator
         logger.info(f"[Turn {_turn_count}] Analyzing: {last_user_text[:60]}...")
+
+        # Snapshot + reset this turn's raw audio for the shadow-mode voice CX
+        # model, then kick it off in the background -- never awaited here,
+        # so it can't add latency to the actual response.
+        turn_frames, self._audio_buffer = self._audio_buffer, []
+        if voice_cx_client.is_configured() and turn_frames and not self._voice_cx_busy:
+            create_bg_task(self._run_voice_cx(turn_frames))
+        elif self._voice_cx_busy:
+            logger.debug("[VoiceCX] skipping this turn -- previous analysis still in flight")
 
         # ── Layer 1: Input Guardrail ─────────────────────────────────────────────
         input_guard = guardrails.check_input(last_user_text)
@@ -286,7 +344,10 @@ def create_bg_task(coro):
 # ─── Main Entrypoint ─────────────────────────────────────────────────────────────
 
 def prewarm(proc):
-    """Prewarm Silero VAD model on worker startup."""
+    """Prewarm Silero VAD on worker startup. The shadow-mode voice CX model
+    (Stage 1 + Stage 2) runs on a separate server (voice-cx-server/, reached
+    over HTTP via voice_cx_client) -- this process never loads torch/funasr
+    itself, so there's nothing heavy to prewarm for it here."""
     try:
         proc.userdata["vad"] = silero.VAD.load()
         logger.info("[Prewarm] Silero VAD model loaded successfully.")
@@ -314,6 +375,11 @@ async def entrypoint(ctx: JobContext):
         _vad = ctx.proc.userdata.get("vad")
     if _vad is None:
         _vad = silero.VAD.load()
+
+    if voice_cx_client.is_configured():
+        logger.info("[VoiceCX] shadow mode enabled, server: %s", os.getenv("VOICE_CX_SERVER_URL"))
+    else:
+        logger.info("[VoiceCX] shadow mode disabled (VOICE_CX_SERVER_URL not set)")
 
     session = AgentSession(
         vad=_vad,

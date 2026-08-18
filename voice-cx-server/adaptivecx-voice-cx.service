@@ -1,0 +1,19 @@
+[Unit]
+Description=AdaptiveCX Voice CX Server (Stage 1 + Stage 2)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/voice-cx-server
+Environment=PORT=8000
+ExecStart=/home/ubuntu/voice-cx-server/.venv/bin/python main.py
+Restart=on-failure
+RestartSec=5
+# Keeps the process from being killed under memory pressure before
+# lower-priority processes -- this is the one thing on the box that
+# actually needs to stay up.
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target
