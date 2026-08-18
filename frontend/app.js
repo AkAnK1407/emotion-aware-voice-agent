@@ -38,6 +38,7 @@ let interimBubbleEl = null;      // live "still speaking" bubble, replaced on fi
 let lastCustomerBubbleEl = null; // most recent finalized customer bubble, awaiting its emotion tag
 let authSession = null;          // {token, user_id, display_name} once logged in, else null (guest)
 let authMode = "login";          // "login" | "signup" -- which tab is active in the auth card
+let voiceCxEnabled = true;        // voice-CX toggle state (from server)
 
 // ── DOM References ────────────────────────────────────────────────────────────
 const statusDot = document.getElementById("statusDot");
@@ -513,6 +514,12 @@ function handleDashboardEvent(data) {
       voiceEscalationValue.textContent = pct(data.escalation_risk);
       voiceEmotionValue.textContent = (data.emotion || "—").toUpperCase();
       break;
+
+    case "voice_cx_toggle":
+      // Toggle state changed (either on this client or another connected client)
+      voiceCxEnabled = data.enabled;
+      updateVoiceCxToggleDisplay();
+      break;
   }
 }
 
@@ -882,6 +889,19 @@ async function leaveRoom() {
   }
 }
 
+function updateVoiceCxToggleDisplay() {
+  const voiceCxToggleBtn = document.getElementById("voiceCxToggleBtn");
+  if (voiceCxEnabled) {
+    voiceCxToggleBtn.textContent = "🎙️ Voice Primary: ON";
+    voiceCxToggleBtn.style.background = "rgba(34,197,94,0.15)";
+    voiceCxToggleBtn.style.color = "#22c55e";
+  } else {
+    voiceCxToggleBtn.textContent = "💬 Text Fallback (forced)";
+    voiceCxToggleBtn.style.background = "rgba(156,163,175,0.15)";
+    voiceCxToggleBtn.style.color = "#9ca3af";
+  }
+}
+
 // ── Event Listeners ───────────────────────────────────────────────────────────
 
 joinBtn.addEventListener("click", joinRoom);
@@ -907,6 +927,18 @@ logoutBtn.addEventListener("click", logout);
 historyBtn.addEventListener("click", openHistoryPanel);
 historyCloseBtn.addEventListener("click", closeHistoryPanel);
 historyBackdrop.addEventListener("click", closeHistoryPanel);
+
+document.getElementById("voiceCxToggleBtn").addEventListener("click", () => {
+  voiceCxEnabled = !voiceCxEnabled;
+  updateVoiceCxToggleDisplay();
+  // Send toggle to agent
+  if (dashWs && dashWs.readyState === WebSocket.OPEN) {
+    dashWs.send(JSON.stringify({
+      type: "toggle_voice_cx",
+      enabled: voiceCxEnabled,
+    }));
+  }
+});
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 

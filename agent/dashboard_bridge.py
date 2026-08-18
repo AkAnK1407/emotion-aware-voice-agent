@@ -37,6 +37,7 @@ from websockets.asyncio.server import ServerConnection
 
 from emotion_engine import BehaviorSignals
 from policy_engine import Policy
+import voice_cx_toggle
 
 logger = logging.getLogger("dashboard_bridge")
 
@@ -130,8 +131,25 @@ async def _handler(websocket: ServerConnection):
             "type": "connected",
             "message": "AdaptiveCX Dashboard connected. Waiting for voice input...",
         }))
-        # Keep connection alive, wait for disconnect
-        await websocket.wait_closed()
+        # Send current toggle state so fresh page loads reflect reality
+        await websocket.send(json.dumps({
+            "type": "voice_cx_toggle",
+            "enabled": voice_cx_toggle.is_voice_enabled(),
+        }))
+        # Keep connection alive, handle incoming messages + wait for disconnect
+        async for message in websocket:
+            try:
+                data = json.loads(message)
+                if data.get("type") == "toggle_voice_cx":
+                    enabled = data.get("enabled", True)
+                    voice_cx_toggle.set_voice_enabled(enabled)
+                    # Broadcast to all connected clients so they stay in sync
+                    await _local_broadcast({
+                        "type": "voice_cx_toggle",
+                        "enabled": enabled,
+                    })
+            except Exception as e:
+                logger.warning(f"[Handler] failed to process incoming message: {e}")
     finally:
         _connected_clients.discard(websocket)
         logger.info(f"Dashboard client disconnected. Total: {len(_connected_clients)}")

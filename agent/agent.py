@@ -46,6 +46,7 @@ import observability
 import storage
 import tools
 import voice_cx_client
+import voice_cx_toggle
 from emotion_engine import (
     EMOTION_COLORS,
     EMOTION_EMOJI,
@@ -59,6 +60,12 @@ from policy_engine import PolicyEngine, Policy
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("adaptivecx-agent")
+
+# ─── Racing Configuration ────────────────────────────────────────────────────────
+# Voice-CX (Stage 1) races against text-based fallback with this timeout.
+# If voice doesn't answer within RACE_TIMEOUT, we proceed immediately with text
+# and let voice complete in the background (async callback).
+RACE_TIMEOUT = 3.5  # seconds — tunes the latency/accuracy tradeoff
 
 # ─── Global Instances ────────────────────────────────────────────────────────────
 emotion_engine = EmotionEngine()
@@ -354,70 +361,91 @@ class AdaptiveCXAgent(Agent):
             logger.warning(f"[Guardrail:input] {input_guard.category} flags={input_guard.flags}")
 
         # ── Layer 2: Behavior Intelligence ────────────────────────────────────────
-        # Stage 1 (voice, validated against real IEMOCAP test data) is the
-        # primary signal. It's awaited with a timeout -- a real, felt
-        # latency cost on every turn, accepted deliberately because
-        # emotion_engine.py's text formula has no such validation behind it
-        # at all. Falls back to the text formula only if Stage 1 doesn't
-        # answer in time or the server's unreachable -- the agent must
-        # never go silent because of this.
-        #
-        # Timeout: audio-length-dependent (see voice_cx_client.estimate_timeout)
-        # -- inference on the EC2 server runs roughly realtime, plus network
-        # overhead through the SSH tunnel, so a fixed cap silently discarded
-        # every turn longer than ~9-10s of speech. Logs actual elapsed time
-        # (and the budget used) on every attempt so the real number is
-        # measured, not guessed at again.
-        behavior = None
-        policy = None
+        # Compute text-based behavior immediately (fallback, sub-millisecond).
+        behavior = emotion_engine.detect(last_user_text)
+        policy = policy_engine.select(behavior)
         source = "text"
         voice_cx_result = None
 
-        _vcx_now = time.monotonic()
-        if _vcx_now < self._voice_cx_cooldown_until:
-            logger.info(
-                f"[VoiceCX] skipping -- still in cooldown for "
-                f"{self._voice_cx_cooldown_until - _vcx_now:.1f}s after the last failure "
-                f"(server's likely still finishing that abandoned request), falling back to text"
-            )
-        elif voice_cx_client.is_configured() and turn_frames and not self._voice_cx_busy:
-            self._voice_cx_busy = True
-            _vcx_t0 = time.monotonic()
-            _vcx_timeout = voice_cx_client.estimate_timeout(turn_frames)
-            try:
-                voice_cx_result = await asyncio.wait_for(
-                    voice_cx_client.predict_from_frames(turn_frames, timeout=_vcx_timeout),
-                    timeout=_vcx_timeout,
-                )
-                logger.info(f"[VoiceCX] responded in {time.monotonic() - _vcx_t0:.2f}s (budget {_vcx_timeout:.1f}s)")
-            except Exception as e:
+        # Check manual toggle: if voice CX is force-disabled, skip to text.
+        if not voice_cx_toggle.is_voice_enabled():
+            logger.info("[VoiceCX Toggle] voice-CX is manually disabled, using text fallback")
+        # Otherwise, race voice-CX against RACE_TIMEOUT.
+        elif voice_cx_client.is_configured() and turn_frames:
+            _vcx_now = time.monotonic()
+            if _vcx_now < self._voice_cx_cooldown_until:
                 logger.info(
-                    f"[VoiceCX] not available this turn after {time.monotonic() - _vcx_t0:.2f}s "
-                    f"(budget {_vcx_timeout:.1f}s), falling back to text ({e!r})"
+                    f"[VoiceCX] skipping -- still in cooldown for "
+                    f"{self._voice_cx_cooldown_until - _vcx_now:.1f}s, racing text instead"
                 )
-                self._voice_cx_cooldown_until = time.monotonic() + 8.0
-            finally:
-                self._voice_cx_busy = False
-        elif self._voice_cx_busy:
-            logger.info("[VoiceCX] previous analysis still in flight, falling back to text this turn")
+            elif self._voice_cx_busy:
+                logger.info("[VoiceCX] previous analysis still in flight, racing text instead")
+            else:
+                # Launch voice-CX as a background task, race it against RACE_TIMEOUT.
+                self._voice_cx_busy = True
+                _vcx_t0 = time.monotonic()
+                _vcx_timeout = voice_cx_client.estimate_timeout(turn_frames)
+                voice_task = asyncio.create_task(
+                    voice_cx_client.predict_from_frames(turn_frames, timeout=_vcx_timeout)
+                )
 
-        if voice_cx_result is not None:
-            behavior = _behavior_from_stage1(voice_cx_result, last_user_text)
-            policy = policy_engine.select_from_stage1(
-                voice_cx_result["emotion"], voice_cx_result["arousal"], voice_cx_result["valence"]
-            )
-            source = "voice"
-            # Also feeds the dashboard's "VOICE-BASED CX" experimental panel
-            # (Stage 2's stress/frustration/urgency/escalation_risk) -- still
-            # display-only, not used for the decision above.
-            await dashboard_bridge.broadcast_voice_cx(voice_cx_result)
-            logger.info(
-                f"[VoiceCX] driving this turn: emotion={voice_cx_result['emotion']} "
-                f"arousal={voice_cx_result['arousal']:.2f} valence={voice_cx_result['valence']:.2f}"
-            )
-        else:
-            behavior = emotion_engine.detect(last_user_text)
-            policy = policy_engine.select(behavior)
+                # Attach callback to handle completion (success or timeout) asynchronously.
+                def _voice_cx_callback(task):
+                    try:
+                        result = task.result()  # may raise if task failed
+                        logger.info(
+                            f"[VoiceCX] completed (late, after race timed out) in "
+                            f"{time.monotonic() - _vcx_t0:.2f}s: emotion={result['emotion']}"
+                        )
+                        create_bg_task(dashboard_bridge.broadcast_voice_cx(result))
+                    except asyncio.CancelledError:
+                        pass  # task was cancelled
+                    except Exception as e:
+                        logger.info(
+                            f"[VoiceCX] completed (late, after race timed out) but failed "
+                            f"after {time.monotonic() - _vcx_t0:.2f}s: {e!r}"
+                        )
+                        self._voice_cx_cooldown_until = time.monotonic() + 8.0
+                    finally:
+                        self._voice_cx_busy = False
+
+                voice_task.add_done_callback(_voice_cx_callback)
+
+                # Race voice-CX against RACE_TIMEOUT (much shorter than the full estimate).
+                try:
+                    voice_cx_result = await asyncio.wait_for(voice_task, timeout=RACE_TIMEOUT)
+                    # Voice won the race!
+                    logger.info(
+                        f"[VoiceCX] won race in {time.monotonic() - _vcx_t0:.2f}s "
+                        f"(budget {RACE_TIMEOUT:.1f}s)"
+                    )
+                    behavior = _behavior_from_stage1(voice_cx_result, last_user_text)
+                    policy = policy_engine.select_from_stage1(
+                        voice_cx_result["emotion"], voice_cx_result["arousal"], voice_cx_result["valence"]
+                    )
+                    source = "voice"
+                    await dashboard_bridge.broadcast_voice_cx(voice_cx_result)
+                    logger.info(
+                        f"[VoiceCX] driving this turn: emotion={voice_cx_result['emotion']} "
+                        f"arousal={voice_cx_result['arousal']:.2f} valence={voice_cx_result['valence']:.2f}"
+                    )
+                    # Clear the callback since we're handling completion here, not letting it complete late.
+                    voice_task._callbacks.clear()
+                except asyncio.TimeoutError:
+                    # Voice lost the race. Text fallback proceeds immediately.
+                    logger.info(
+                        f"[VoiceCX] lost race after {time.monotonic() - _vcx_t0:.2f}s "
+                        f"(timeout {RACE_TIMEOUT:.1f}s), text fallback in use. "
+                        f"Voice task will continue in background (budget {_vcx_timeout:.1f}s)"
+                    )
+                    # Callback remains attached, will handle the background completion.
+                except Exception as e:
+                    # Voice task failed before timeout (network error, server error, etc).
+                    logger.info(
+                        f"[VoiceCX] failed in race after {time.monotonic() - _vcx_t0:.2f}s: {e!r}, "
+                        f"text fallback in use"
+                    )
+                    # Callback will still run and set the cooldown.
 
         _current_behavior = behavior
         _current_policy = policy
