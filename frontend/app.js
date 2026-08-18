@@ -16,12 +16,12 @@ const LIVEKIT_URL = "wss://voice-agent-9u8rfie6.ohyderabad1a.production.livekit.
 // Backend (agent worker + dashboard WS + /token) hostname when not running
 // locally. Update this whenever you restart the Cloudflare Tunnel / redeploy
 // to Render — quick tunnels get a new random hostname each run.
-const BACKEND_HOST = "suit-discount-downloadable-jefferson.trycloudflare.com";
+const BACKEND_HOST = "indicator-bracelets-ccd-average.trycloudflare.com";
 
 // Login/signup/history API (auth_server.py) — separate service, separate
 // tunnel, since dashboard_bridge's server can't accept anything but a
 // bodyless GET. Same "update after restarting the tunnel" caveat as above.
-const AUTH_HOST = "tuition-clothes-stewart-wheels.trycloudflare.com";
+const AUTH_HOST = "reed-protecting-matthew-sacred.trycloudflare.com";
 
 const IS_LOCAL = location.hostname === "localhost" || location.hostname === "127.0.0.1";
 const DASHBOARD_WS = IS_LOCAL ? "ws://localhost:8765" : `wss://${BACKEND_HOST}/`;
@@ -119,6 +119,7 @@ roomInput.style.opacity = "0.7";
 
 const pipeSteps = {
   stt: document.getElementById("step-stt"),
+  voicecx: document.getElementById("step-voicecx"),
   behavior: document.getElementById("step-behavior"),
   policy: document.getElementById("step-policy"),
   llm: document.getElementById("step-llm"),
@@ -152,6 +153,7 @@ const authForm = document.getElementById("authForm");
 const authError = document.getElementById("authError");
 const authUsername = document.getElementById("authUsername");
 const authDisplayName = document.getElementById("authDisplayName");
+const authDob = document.getElementById("authDob");
 const authPassword = document.getElementById("authPassword");
 const authSubmitBtn = document.getElementById("authSubmitBtn");
 const authCloseBtn = document.getElementById("authCloseBtn");
@@ -166,6 +168,11 @@ const historyBtn = document.getElementById("historyBtn");
 const historyPanel = document.getElementById("historyPanel");
 const historyBackdrop = document.getElementById("historyBackdrop");
 const historyBody = document.getElementById("historyBody");
+const transactionsBtn = document.getElementById("transactionsBtn");
+const transactionsPanel = document.getElementById("transactionsPanel");
+const transactionsBackdrop = document.getElementById("transactionsBackdrop");
+const transactionsBody = document.getElementById("transactionsBody");
+const transactionsCloseBtn = document.getElementById("transactionsCloseBtn");
 const historyCloseBtn = document.getElementById("historyCloseBtn");
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -215,28 +222,21 @@ function hideAudioUnlockBtn() {
   }
 }
 
-function animatePipe(stepId) {
-  const order = ["stt", "behavior", "policy", "llm", "tts"];
-  let delay = 0;
-  for (const key of order) {
-    pipeSteps[key].className = "pipe-step";
-    pipeSteps[key].querySelector(".pipe-status").textContent = "Idle";
-  }
-  for (const key of order) {
-    ((k, d) => {
-      setTimeout(() => {
-        // Activate
-        pipeSteps[k].className = "pipe-step active";
-        pipeSteps[k].querySelector(".pipe-status").textContent = "Processing...";
-        // Then mark done after 600ms
-        setTimeout(() => {
-          pipeSteps[k].className = "pipe-step done";
-          pipeSteps[k].querySelector(".pipe-status").textContent = "Done";
-        }, 600);
-      }, d);
-    })(key, delay);
-    delay += 350;
-  }
+// Pipeline visualizer is driven by the real dashboard events for this turn
+// (transcript/voice_cx/behavior/agent_response/observability) rather than a
+// fixed timer -- each step's state reflects when that stage actually ran.
+const PIPE_ORDER = ["stt", "voicecx", "behavior", "policy", "llm", "tts"];
+
+function markStep(key, status, label) {
+  const el = pipeSteps[key];
+  if (!el) return;
+  el.className = "pipe-step" + (status === "idle" ? "" : " " + status);
+  el.querySelector(".pipe-status").textContent =
+    label || { idle: "Idle", active: "Processing...", done: "Done", skipped: "Skipped" }[status];
+}
+
+function resetPipeline() {
+  for (const key of PIPE_ORDER) markStep(key, "idle");
 }
 
 function addBubble(speaker, text, emotionTag, emotionColor) {
@@ -352,7 +352,11 @@ function updatePatiencePips(patience) {
 // ── Dashboard WebSocket ───────────────────────────────────────────────────────
 
 function connectDashboard() {
-  dashWs = new WebSocket(DASHBOARD_WS);
+  // Tag this connection with the room we're about to join, so the server
+  // only broadcasts this room's transcript/emotion/policy events to us --
+  // not every other user's conversation happening on the same backend.
+  const separator = DASHBOARD_WS.includes("?") ? "&" : "?";
+  dashWs = new WebSocket(`${DASHBOARD_WS}${separator}room=${encodeURIComponent(AUTO_ROOM_NAME)}`);
 
   dashWs.onopen = () => {
     console.log("[Dashboard] Connected");
@@ -478,8 +482,10 @@ function handleDashboardEvent(data) {
       // ── Timeline ──────────────────────────────────────────────────────────
       updateEmotionTimeline(data.emotion, data.emotion_color, data.emotion_confidence);
 
-      // ── Pipeline Animation ────────────────────────────────────────────────
-      animatePipe();
+      // ── Pipeline: behavior + policy resolved, LLM prompting starts next ──
+      markStep("behavior", "done");
+      markStep("policy", "done");
+      markStep("llm", "active");
 
       // ── Turn count ────────────────────────────────────────────────────────
       turnCount++;
@@ -492,14 +498,24 @@ function handleDashboardEvent(data) {
         // Live as they speak: update in place, no emotion tag yet (that
         // lands separately once the "behavior" event arrives).
         if (data.is_partial) {
+          if (pipeSteps.stt.className === "pipe-step") resetPipeline();
+          markStep("stt", "active");
           updateInterimBubble(data.text);
         } else {
+          // STT finalized this turn's transcript -- behavior engine and the
+          // voice-CX shadow path both kick off from here in parallel.
+          markStep("stt", "done");
+          markStep("voicecx", voiceCxEnabled ? "active" : "skipped");
+          markStep("behavior", "active");
           finalizeCustomerBubble(data.text);
         }
       }
       break;
 
     case "agent_response":
+      // Gemini's text is ready -- TTS synthesis starts next.
+      markStep("llm", "done");
+      markStep("tts", "active");
       addBubble("agent", data.text, null, null);
       setStatus("Agent responded — listening for next input", "connected");
       break;
@@ -538,6 +554,7 @@ function handleDashboardEvent(data) {
       voiceUrgencyValue.textContent = pct(data.urgency);
       voiceEscalationValue.textContent = pct(data.escalation_risk);
       voiceEmotionValue.textContent = (data.emotion || "—").toUpperCase();
+      markStep("voicecx", "done");
       break;
 
     case "voice_cx_toggle":
@@ -615,12 +632,17 @@ function handleEvaluation(data) {
 
 function handleObservability(data) {
   if (data.stage === "stt") {
-    obsStt.textContent = data.latency_ms + " ms";
+    // Deepgram here is a streaming (websocket) STT -- livekit-agents reports
+    // request `duration` as always 0.0 for streaming STT (there's no single
+    // request round-trip to time), so show the real signal we do have:
+    // how much audio this turn's transcript was built from.
+    obsStt.textContent = data.audio_duration_s + "s audio";
   } else if (data.stage === "llm") {
     obsLlm.textContent = `${data.ttft_ms} / ${data.duration_ms} ms`;
     obsTokens.textContent = `${data.prompt_tokens}+${data.completion_tokens}=${data.total_tokens}`;
   } else if (data.stage === "tts") {
     obsTts.textContent = `${data.ttfb_ms} / ${data.duration_ms} ms`;
+    markStep("tts", "done");
   }
 }
 
@@ -656,11 +678,13 @@ function updateAccountUI() {
     accountName.textContent = "👋 " + authSession.display_name;
     accountName.style.display = "inline";
     historyBtn.style.display = "inline-flex";
+    transactionsBtn.style.display = "inline-flex";
     logoutBtn.style.display = "inline-flex";
     loginOpenBtn.style.display = "none";
   } else {
     accountName.style.display = "none";
     historyBtn.style.display = "none";
+    transactionsBtn.style.display = "none";
     logoutBtn.style.display = "none";
     loginOpenBtn.style.display = "inline-flex";
   }
@@ -671,6 +695,9 @@ function setAuthMode(mode) {
   tabLogin.classList.toggle("active", mode === "login");
   tabSignup.classList.toggle("active", mode === "signup");
   authDisplayName.style.display = mode === "signup" ? "block" : "none";
+  authDob.style.display = mode === "signup" ? "block" : "none";
+  authDisplayName.required = mode === "signup";
+  authDob.required = mode === "signup";
   authSubmitBtn.textContent = mode === "signup" ? "Sign up" : "Log in";
   authError.style.display = "none";
 }
@@ -694,7 +721,10 @@ async function handleAuthSubmit(e) {
   try {
     const path = authMode === "signup" ? "/signup" : "/login";
     const body = { username: authUsername.value.trim(), password: authPassword.value };
-    if (authMode === "signup") body.display_name = authDisplayName.value.trim();
+    if (authMode === "signup") {
+      body.display_name = authDisplayName.value.trim();
+      body.date_of_birth = authDob.value;
+    }
 
     const resp = await fetch(AUTH_URL + path, {
       method: "POST",
@@ -753,6 +783,57 @@ async function openHistoryPanel() {
 function closeHistoryPanel() {
   historyPanel.classList.add("hidden");
   historyBackdrop.classList.add("hidden");
+}
+
+const TXN_STATUS_LABEL = {
+  posted: "Posted", duplicate_flagged: "⚠️ Duplicate flagged", refunded: "✅ Refunded",
+};
+
+async function openTransactionsPanel() {
+  if (!authSession) return;
+  transactionsPanel.classList.remove("hidden");
+  transactionsBackdrop.classList.remove("hidden");
+  transactionsBody.innerHTML = '<div class="history-placeholder">Loading…</div>';
+  try {
+    const resp = await fetch(AUTH_URL + "/transactions", {
+      headers: { "Authorization": "Bearer " + authSession.token },
+    });
+    if (!resp.ok) throw new Error("Could not load transactions.");
+    const data = await resp.json();
+    renderTransactions(data);
+  } catch (err) {
+    transactionsBody.innerHTML = `<div class="history-placeholder">${err.message}</div>`;
+  }
+}
+
+function closeTransactionsPanel() {
+  transactionsPanel.classList.add("hidden");
+  transactionsBackdrop.classList.add("hidden");
+}
+
+function renderTransactions(data) {
+  const header = document.createElement("div");
+  header.className = "history-room-divider";
+  header.textContent = `${data.account_id} · ${data.tier} tier · Balance $${data.balance.toFixed(2)}`;
+  transactionsBody.innerHTML = "";
+  transactionsBody.appendChild(header);
+
+  for (const t of data.transactions) {
+    const wrap = document.createElement("div");
+    wrap.className = "history-turn agent";
+    wrap.innerHTML = `
+      <div class="h-speaker">${t.transaction_id}</div>
+      <div class="h-text"></div>
+      <div class="h-time">${t.date} · $${t.amount.toFixed(2)} · ${TXN_STATUS_LABEL[t.status] || t.status}</div>
+    `;
+    wrap.querySelector(".h-text").textContent = t.merchant;
+    transactionsBody.appendChild(wrap);
+  }
+
+  const hint = document.createElement("div");
+  hint.className = "history-placeholder";
+  hint.textContent = "Ask the agent about any of these on your call, e.g. \"what was that Amazon charge?\"";
+  transactionsBody.appendChild(hint);
 }
 
 function renderHistory(turns) {
@@ -952,6 +1033,9 @@ logoutBtn.addEventListener("click", logout);
 historyBtn.addEventListener("click", openHistoryPanel);
 historyCloseBtn.addEventListener("click", closeHistoryPanel);
 historyBackdrop.addEventListener("click", closeHistoryPanel);
+transactionsBtn.addEventListener("click", openTransactionsPanel);
+transactionsCloseBtn.addEventListener("click", closeTransactionsPanel);
+transactionsBackdrop.addEventListener("click", closeTransactionsPanel);
 
 document.getElementById("voiceCxToggleBtn").addEventListener("click", () => {
   voiceCxEnabled = !voiceCxEnabled;

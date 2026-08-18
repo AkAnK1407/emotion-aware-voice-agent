@@ -763,6 +763,8 @@ body::before {
 }
 .pipe-step.active .pipe-status { color: var(--accent-purple); }
 .pipe-step.done .pipe-status { color: var(--accent-green); }
+.pipe-step.skipped { opacity: 0.5; }
+.pipe-step.skipped .pipe-status { color: var(--text-muted); }
 .pipe-arrow { color: var(--text-muted); font-size: 12px; }
 
 /* ── Emotion Timeline Chart ─────────────────────────────────────────────────── */

@@ -32,6 +32,7 @@
     <div class="account-widget" id="accountWidget">
       <span class="account-name" id="accountName" style="display:none;"></span>
       <button class="btn-chip" id="historyBtn" style="display:none;">🕐 History</button>
+      <button class="btn-chip" id="transactionsBtn" style="display:none;">🧾 Transactions</button>
       <button class="btn-chip" id="loginOpenBtn">👤 Log in</button>
       <button class="btn-chip" id="logoutBtn" style="display:none;">Log out</button>
     </div>
@@ -52,7 +53,8 @@
     <form class="auth-body" id="authForm">
       <div class="auth-error" id="authError" style="display:none;"></div>
       <input class="room-input" id="authUsername" placeholder="Username" autocomplete="username" required />
-      <input class="room-input" id="authDisplayName" placeholder="Display name (optional)" style="display:none;" />
+      <input class="room-input" id="authDisplayName" placeholder="Full name" style="display:none;" />
+      <input class="room-input" id="authDob" type="date" placeholder="Date of birth" style="display:none;" />
       <input class="room-input" id="authPassword" type="password" placeholder="Password" autocomplete="current-password" required />
       <button class="btn btn-primary" id="authSubmitBtn" type="submit" style="width:100%;">Log in</button>
     </form>
@@ -69,6 +71,18 @@
   </div>
   <div class="history-body" id="historyBody">
     <div class="history-placeholder">No conversations yet.</div>
+  </div>
+</div>
+
+<!-- ── TRANSACTIONS PANEL ─────────────────────────────────────────────────────────── -->
+<div class="history-backdrop hidden" id="transactionsBackdrop"></div>
+<div class="history-panel hidden" id="transactionsPanel">
+  <div class="history-header">
+    <span>🧾 Your Account</span>
+    <button class="auth-close" id="transactionsCloseBtn" aria-label="Close">✕</button>
+  </div>
+  <div class="history-body" id="transactionsBody">
+    <div class="history-placeholder">Loading…</div>
   </div>
 </div>
 
@@ -278,6 +292,12 @@
           <div class="pipe-status">Ready</div>
         </div>
         <div class="pipe-arrow">↓</div>
+        <div class="pipe-step" id="step-voicecx">
+          <div class="pipe-icon">🧬</div>
+          <div class="pipe-name">Voice-CX (GPU)</div>
+          <div class="pipe-status">Idle</div>
+        </div>
+        <div class="pipe-arrow">↓</div>
         <div class="pipe-step" id="step-behavior">
           <div class="pipe-icon">🧠</div>
           <div class="pipe-name">Behavior Engine</div>
@@ -316,18 +336,26 @@
     <div class="card statement-card">
       <div class="card-label">PROBLEM STATEMENT</div>
       <p class="statement-text">
-        Traditional bots ignore <strong>how</strong> you feel.
-        AdaptiveCX detects your emotional state in real time and
-        dynamically adapts its strategy, response, and voice tone —
-        treating every customer as an individual human being.
+        Conversational agents typically condition responses on
+        transcript text alone, discarding the affective signal carried
+        in the audio channel. AdaptiveCX runs a dual-path inference
+        pipeline: text-derived sentiment/prosody features drive the
+        live policy decision on a low-latency path, while a
+        GPU-accelerated acoustic model (emotion2vec+ embeddings →
+        XGBoost regressors for stress, frustration, urgency, and
+        escalation risk) scores the raw waveform in parallel for
+        cross-validation. Policy selection, LLM prompting, and TTS
+        prosody are re-parameterized per turn based on the resulting
+        state estimate — closing the loop between detected affect and
+        generated response.
       </p>
       <div class="feature-list">
-        <div class="feature">✅ Real-time emotion detection</div>
-        <div class="feature">✅ Stress &amp; prosody analysis</div>
-        <div class="feature">✅ Adaptive policy selection</div>
-        <div class="feature">✅ Gemini-powered responses</div>
-        <div class="feature">✅ Emotion-aware TTS voice</div>
-        <div class="feature">✅ Live dashboard visualization</div>
+        <div class="feature">✅ Real-time multimodal emotion inference</div>
+        <div class="feature">✅ Text + acoustic dual-path (shadow-mode validation)</div>
+        <div class="feature">✅ Prosody-conditioned policy selection</div>
+        <div class="feature">✅ Gemini-powered response generation</div>
+        <div class="feature">✅ Emotion-conditioned TTS synthesis</div>
+        <div class="feature">✅ Live observability &amp; cost telemetry</div>
       </div>
     </div>
 

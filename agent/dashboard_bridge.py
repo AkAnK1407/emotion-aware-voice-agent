@@ -44,6 +44,25 @@ logger = logging.getLogger("dashboard_bridge")
 # Global set of connected browser clients
 _connected_clients: Set[ServerConnection] = set()
 
+# Which LiveKit room each connected browser dashboard is watching, keyed by
+# connection -- so events from one user's conversation don't get broadcast to
+# every other connected dashboard. Populated from the "room" query param on
+# the WS connection URL (see _process_request/_handler below).
+_client_rooms: dict = {}
+
+# Which room the current process's agent job is handling. Each job runs in
+# its own subprocess (see module docstring), so this is set once per job via
+# set_current_room() and stays correct for that subprocess's lifetime --
+# broadcast() reads it to tag every outgoing event with its room of origin.
+_current_room: str = ""
+
+
+def set_current_room(room_name: str):
+    """Called once per agent job (from agent.py's entrypoint) so every event
+    this subprocess broadcasts gets tagged with the room it belongs to."""
+    global _current_room
+    _current_room = room_name
+
 # Localhost-only port used to relay broadcast events from a job subprocess
 # back into the process that owns the real WebSocket connections. Never
 # exposed externally — only the public WS/HTTP port above is.
@@ -97,6 +116,12 @@ def _process_request(connection: ServerConnection, request):
     parsed = urlparse(request.path)
     is_ws_upgrade = (request.headers.get("Upgrade", "") or "").lower() == "websocket"
 
+    if is_ws_upgrade:
+        # Stash the room this browser wants to watch on the connection object
+        # itself -- _handler() reads it back once the handshake completes.
+        qs = parse_qs(parsed.query)
+        connection.dashboard_room = qs.get("room", [""])[0]
+
     if parsed.path == "/token":
         qs = parse_qs(parsed.query)
         room = qs.get("room", ["adaptivecx-demo-room"])[0]
@@ -124,7 +149,11 @@ async def _handler(websocket: ServerConnection):
     disconnecting.
     """
     _connected_clients.add(websocket)
-    logger.info(f"Dashboard client connected. Total: {len(_connected_clients)}")
+    _client_rooms[websocket] = getattr(websocket, "dashboard_room", "")
+    logger.info(
+        f"Dashboard client connected (room={_client_rooms[websocket] or '<none>'}). "
+        f"Total: {len(_connected_clients)}"
+    )
     try:
         # Send welcome event
         await websocket.send(json.dumps({
@@ -152,34 +181,53 @@ async def _handler(websocket: ServerConnection):
                 logger.warning(f"[Handler] failed to process incoming message: {e}")
     finally:
         _connected_clients.discard(websocket)
+        _client_rooms.pop(websocket, None)
         logger.info(f"Dashboard client disconnected. Total: {len(_connected_clients)}")
 
 
 async def _local_broadcast(event: dict):
     """Actually pushes to connected WS clients. Only ever called from within
     the process running start_server() — via the WS handler or the bridge
-    listener below, both on that process's single event loop."""
+    listener below, both on that process's single event loop.
+
+    Room-scoped: an event tagged with "room" (i.e. it came from a specific
+    user's conversation, via broadcast() below) only goes to browsers
+    watching that same room -- otherwise every connected dashboard would see
+    every other user's transcript/emotion/policy events. Events with no
+    "room" key (the one-off "connected" welcome and the demo-wide
+    "voice_cx_toggle" state) are genuinely global and go to everyone.
+    """
     if not _connected_clients:
         return
+    event_room = event.get("room")
     message = json.dumps(event)
     dead = set()
     for ws in list(_connected_clients):
+        if event_room and _client_rooms.get(ws) != event_room:
+            continue
         try:
             await ws.send(message)
         except Exception:
             dead.add(ws)
     for ws in dead:
         _connected_clients.discard(ws)
+        _client_rooms.pop(ws, None)
 
 
 async def broadcast(event: dict):
-    """Broadcast an event dict to all connected browser clients.
+    """Broadcast an event dict to browser clients watching this job's room.
 
     Always forwards over the localhost TCP bridge, even if called from within
     the same process that owns `_connected_clients` — that keeps this function
     correct regardless of whether the caller is agent.py's job subprocess or
     (in a future refactor) the same process, without needing to detect which.
+
+    Tags the event with this subprocess's room (set once via
+    set_current_room()) so _local_broadcast only delivers it to dashboards
+    watching that same room, not every connected browser.
     """
+    if _current_room:
+        event = {**event, "room": _current_room}
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection("127.0.0.1", _BRIDGE_PORT), timeout=2.0

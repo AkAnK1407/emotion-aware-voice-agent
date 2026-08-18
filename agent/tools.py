@@ -26,6 +26,7 @@ from datetime import datetime, timedelta
 
 from livekit.agents import function_tool
 
+import banking_data
 import dashboard_bridge
 import storage
 
@@ -232,7 +233,19 @@ class _MockBankingStore:
         return f"RFD-{self._refund_seq}"
 
 
-_store = _MockBankingStore()
+# Fallback for unauthenticated (guest) sessions -- unverified, matches the
+# original demo customer story exactly as before.
+_GUEST_STORE = _MockBankingStore()
+_store = _GUEST_STORE
+
+# Logged-in customers each get their own account (tier/balance/5 transactions
+# deterministically derived from user_id, see banking_data.py) instead of all
+# sharing the one demo customer. Built lazily and cached for this process's
+# lifetime -- a fresh livekit-agents job subprocess per call, so this cache
+# is naturally scoped to however many distinct accounts call in during that
+# process's life, not persisted across restarts (transactions are re-derived
+# from user_id on demand anyway, so nothing is lost).
+_user_stores: dict[int, _MockBankingStore] = {}
 
 # Set once per call by agent.py:entrypoint after the joining LiveKit
 # participant's identity is resolved to a logged-in account (None for guest
@@ -240,20 +253,40 @@ _store = _MockBankingStore()
 _current_user_id: int | None = None
 
 
+def _build_user_store(user_id: int, full_name: str, date_of_birth: str) -> _MockBankingStore:
+    account = banking_data.build_account(user_id)
+    store = _MockBankingStore.__new__(_MockBankingStore)
+    store.customer = CustomerProfile(
+        account_id=account.account_id, full_name=full_name, date_of_birth=date_of_birth,
+        tier=account.tier, balance=account.balance, open_tickets=account.open_tickets,
+        identity_verified=True,
+    )
+    store.transactions = list(account.transactions)
+    store.tickets = []
+    store.refunds = []
+    store._ticket_seq = 4400 + user_id
+    store._refund_seq = 900 + user_id
+    return store
+
+
 def set_current_user(user_id: int | None) -> None:
-    """Hydrates the mock CRM's identity_verified state from a prior
-    verification tied to this account, so a returning logged-in customer
-    never has to restate their name/DOB. Guest sessions (user_id=None) are
-    untouched."""
-    global _current_user_id
+    """Points the mock CRM at this caller's own account, hydrated from their
+    signup identity (name + DOB, saved at signup -- see auth_server.py) so a
+    logged-in customer never has to state or verify their identity on the
+    call. Guest sessions (user_id=None, or an old account with no saved
+    identity) fall back to the original unverified demo customer."""
+    global _current_user_id, _store
     _current_user_id = user_id
     if user_id is None:
+        _store = _GUEST_STORE
         return
     prior = storage.get_verified_identity(user_id)
-    if prior is not None:
-        _store.customer.identity_verified = True
-        _store.customer.full_name = prior.full_name
-        _store.customer.date_of_birth = prior.date_of_birth
+    if prior is None:
+        _store = _GUEST_STORE
+        return
+    if user_id not in _user_stores:
+        _user_stores[user_id] = _build_user_store(user_id, prior.full_name, prior.date_of_birth)
+    _store = _user_stores[user_id]
 
 
 def verified_customer_note() -> str:
@@ -263,9 +296,9 @@ def verified_customer_note() -> str:
     default behavior (unverified, ask normally) is unaffected."""
     if _current_user_id is not None and _store.customer.identity_verified:
         return (
-            f"\n\nThe caller is already verified as {_store.customer.full_name} from a "
-            f"previous call. Do not ask them to verify their identity again unless they "
-            f"explicitly want to switch accounts."
+            f"\n\nThe caller is already verified as {_store.customer.full_name} from their "
+            f"account signup. Do not ask them to verify their identity again unless they "
+            f"explicitly want to switch accounts. Greet them by name."
         )
     return ""
 
@@ -352,10 +385,38 @@ async def create_support_ticket(summary: str, priority: str = "normal") -> str:
     return result
 
 
+_MEETING_SLOTS = ["10:00 AM", "11:30 AM", "1:30 PM", "3:45 PM", "5:15 PM"]
+
+
+@function_tool
+async def escalate_to_specialist(summary: str, reason: str) -> str:
+    """Escalate the caller to a live human specialist -- use this when the issue is
+    outside what you can resolve on this call, or the customer is still unsatisfied
+    after your best effort. Creates a priority ticket and books a callback meeting
+    with a real specialist, returning a meeting link and time the customer can join."""
+    ticket_id = _store.next_ticket_id()
+    _store.tickets.append({"ticket_id": ticket_id, "summary": summary, "priority": "high"})
+    _store.customer.open_tickets += 1
+    meeting_day = (datetime.now() + timedelta(days=1)).strftime("%A, %B %d")
+    slot = _MEETING_SLOTS[_store._ticket_seq % len(_MEETING_SLOTS)]
+    meeting_link = f"https://meet.adaptivecx.example/{ticket_id.lower()}"
+    result = (
+        f"Escalation ticket {ticket_id} created (reason: {reason}). A specialist is "
+        f"booked to meet you on {meeting_day} at {slot}. Meeting link: {meeting_link}"
+    )
+    await dashboard_bridge.broadcast_tool_call(
+        "escalate_to_specialist",
+        {"summary": summary, "reason": reason},
+        result,
+    )
+    return result
+
+
 BANKING_TOOLS = [
     verify_identity,
     lookup_customer_profile,
     check_recent_transactions,
     process_refund,
     create_support_ticket,
+    escalate_to_specialist,
 ]

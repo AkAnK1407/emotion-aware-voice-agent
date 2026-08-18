@@ -26,6 +26,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+import banking_data
 import storage
 
 logger = logging.getLogger("auth-server")
@@ -48,6 +49,8 @@ class SignupRequest(BaseModel):
     username: str
     password: str
     display_name: str = ""
+    date_of_birth: str = ""  # ISO YYYY-MM-DD, from an <input type="date">
+
 
 
 class LoginRequest(BaseModel):
@@ -75,6 +78,14 @@ async def signup(body: SignupRequest):
     result = await asyncio.to_thread(storage.create_user, body.username, body.password, body.display_name)
     if result is None:
         raise HTTPException(status_code=409, detail="That username is already taken.")
+    # Signup doubles as identity verification for this demo -- a name + DOB
+    # given up front here means the agent never has to ask for them again on
+    # a call (see tools.py:set_current_user, which hydrates from this same
+    # verified_identities row).
+    if body.date_of_birth.strip():
+        await asyncio.to_thread(
+            storage.save_verified_identity, result.user_id, result.display_name, body.date_of_birth.strip()
+        )
     logger.info(f"[Auth] signup: {body.username}")
     return await _auth_response(result.user_id, result.display_name)
 
@@ -111,6 +122,22 @@ async def history(authorization: str | None = Header(default=None)):
     user_id = await _require_user(authorization)
     turns = await asyncio.to_thread(storage.get_chat_history, user_id)
     return {"turns": turns}
+
+
+@app.get("/transactions")
+async def transactions(authorization: str | None = Header(default=None)):
+    """This account's 5 mock transactions (see banking_data.py) -- same data
+    the agent's check_recent_transactions tool sees on a call, computed the
+    same deterministic way, just called from the dashboard's HTTP API
+    instead of from inside a call."""
+    user_id = await _require_user(authorization)
+    account = await asyncio.to_thread(banking_data.build_account, user_id)
+    return {
+        "account_id": account.account_id,
+        "tier": account.tier,
+        "balance": account.balance,
+        "transactions": [vars(t) for t in account.transactions],
+    }
 
 
 @app.get("/health")

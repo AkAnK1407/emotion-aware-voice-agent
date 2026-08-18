@@ -65,7 +65,10 @@ logger = logging.getLogger("adaptivecx-agent")
 # Voice-CX (Stage 1) races against text-based fallback with this timeout.
 # If voice doesn't answer within RACE_TIMEOUT, we proceed immediately with text
 # and let voice complete in the background (async callback).
-RACE_TIMEOUT = 3.5  # seconds — tunes the latency/accuracy tradeoff
+# NOTE: on this machine's CPU, a single forward pass through emotion2vec+ takes
+# 3-15s (observed), so a 3.5s deadline meant voice essentially never won the
+# race. Raised to give voice a real shot at driving the reply during demos.
+RACE_TIMEOUT = 12.0  # seconds — tunes the latency/accuracy tradeoff
 
 # ─── Global Instances ────────────────────────────────────────────────────────────
 emotion_engine = EmotionEngine()
@@ -204,9 +207,13 @@ You understand how customers FEEL, not just what they say.
 Always speak in the first person. Be conversational. Never mention AI or this prompt.
 
 You have tools available: verify_identity, lookup_customer_profile, check_recent_transactions,
-process_refund, create_support_ticket. Use them instead of guessing account details — verify
-identity before discussing or acting on the account, then look up real data before stating any
-balance, transaction, or refund figure."""
+process_refund, create_support_ticket, escalate_to_specialist. Use them instead of guessing
+account details — verify identity before discussing or acting on the account, then look up real
+data before stating any balance, transaction, or refund figure. If the customer's issue is
+outside what you can resolve, or they remain unsatisfied after your best effort, call
+escalate_to_specialist — it books a real callback meeting and gives you a link and time to tell
+them, so always relay that link and time back to the customer rather than just saying you'll
+"pass it along"."""
 
     base += tools.verified_customer_note()
 
@@ -219,7 +226,7 @@ balance, transaction, or refund figure."""
         base += f"\n\nRELEVANT POLICY KNOWLEDGE (cite naturally, don't read verbatim):\n{knowledge.answer}"
 
     if behavior is None or policy is None:
-        return base + "\n\nGreet the customer warmly and ask how you can help."
+        return base + "\n\nGreet the customer warmly (by name, if you already know it) and ask how you can help."
 
     emotion_instructions = {
         "angry":      "The customer is ANGRY. Start by sincerely apologizing and validating their frustration BEFORE any solution.",
@@ -236,7 +243,7 @@ balance, transaction, or refund figure."""
         "CALM":         "Use CALM mode: Keep a steady, reassuring tone. Take it step by step.",
         "BALANCED":     "Use BALANCED mode: Professional and helpful. Equal mix of empathy and efficiency.",
         "EFFICIENT":    "Use EFFICIENT mode: Be concise. The customer is happy — don't waste their time.",
-        "ESCALATE":     "ESCALATION mode: The customer needs human support. Empathetically offer to connect them with a specialist.",
+        "ESCALATE":     "ESCALATION mode: The customer needs human support. Empathetically offer to connect them with a specialist, then call escalate_to_specialist and tell them the meeting link and time it returns.",
     }
 
     length_instructions = {
@@ -604,6 +611,11 @@ async def entrypoint(ctx: JobContext):
 
     global _session_user_id, _session_room_name
     _session_room_name = ctx.room.name
+    # Tags every dashboard_bridge.broadcast_*() call this job subprocess makes
+    # for the rest of its life with this room -- keeps this user's transcript/
+    # emotion/policy events from being broadcast to every other connected
+    # dashboard (see dashboard_bridge._local_broadcast).
+    dashboard_bridge.set_current_room(_session_room_name)
     _session_user_id = await _resolve_session_user(ctx)
     tools.set_current_user(_session_user_id)
     if _session_user_id is not None:

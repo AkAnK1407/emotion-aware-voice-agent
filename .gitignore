@@ -11,6 +11,11 @@ scratch/
 *.db-wal
 *.db-shm
 
+# Runtime state / cache, not source.
+agent/voice_cx_toggle.json
+voice-cx-server/_funasr_out/
+voice-cx-server/models.zip
+
 # ── Byte-compiled / optimized / DLL files ──────────────────────────
 __pycache__/
 *.py[codz]
