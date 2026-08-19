@@ -29,6 +29,7 @@ from livekit.agents import function_tool
 
 import banking_data
 import dashboard_bridge
+import guardrails
 import policy_faq
 import storage
 
@@ -350,8 +351,11 @@ async def verify_identity(full_name: str, date_of_birth: str) -> str:
     # name they happened to say out loud didn't string-match, not that
     # they're not who the account login already proved they are.
     if _current_user_id is not None and _store.customer.identity_verified:
-        result = f"Identity already verified for {_store.customer.full_name} from account login -- no need to re-verify."
-        await dashboard_bridge.broadcast_tool_call("verify_identity", {"full_name": full_name, "date_of_birth": date_of_birth}, result)
+        result = f"Identity already verified for {guardrails.mask_name(_store.customer.full_name)} from account login -- no need to re-verify."
+        await dashboard_bridge.broadcast_tool_call(
+            "verify_identity", {"full_name": full_name, "date_of_birth": date_of_birth}, result,
+            masked_fields=["last_name"],
+        )
         return result
 
     normalized_dob = _normalize_dob(date_of_birth)
@@ -375,10 +379,13 @@ async def verify_identity(full_name: str, date_of_birth: str) -> str:
             # Logged-in caller -- remember this so next call skips re-asking.
             storage.save_verified_identity(_current_user_id, full_name.strip(), normalized_dob)
     result = (
-        f"Identity VERIFIED for {full_name}." if match
+        f"Identity VERIFIED for {guardrails.mask_name(full_name)}." if match
         else "Identity verification FAILED — name or date of birth does not match our records."
     )
-    await dashboard_bridge.broadcast_tool_call("verify_identity", {"full_name": full_name, "date_of_birth": date_of_birth}, result)
+    await dashboard_bridge.broadcast_tool_call(
+        "verify_identity", {"full_name": full_name, "date_of_birth": date_of_birth}, result,
+        masked_fields=["last_name"] if match else [],
+    )
     return result
 
 
@@ -386,15 +393,22 @@ async def verify_identity(full_name: str, date_of_birth: str) -> str:
 async def lookup_customer_profile() -> str:
     """Look up the caller's account profile: tier, balance, and number of open support tickets."""
     c = _store.customer
+    masked_fields: list[str] = []
     if not c.identity_verified:
         result = "Cannot retrieve profile: identity has not been verified yet. Call verify_identity first."
     else:
+        # Data-privacy guardrail: the LLM only needs the balance/tier to
+        # answer the caller, never the exact account number or full name --
+        # masked here before the tool result ever reaches Gemini.
         result = (
-            f"Account {c.account_id} — {c.full_name}, tier={c.tier}, "
-            f"balance=${c.balance:,.2f}, open_tickets={c.open_tickets}, "
+            f"Account {guardrails.mask_account_id(c.account_id)} — {guardrails.mask_name(c.full_name)}, "
+            f"tier={c.tier}, balance=${c.balance:,.2f}, open_tickets={c.open_tickets}, "
             f"card_frozen={c.card_frozen}"
         )
-    await dashboard_bridge.broadcast_tool_call("lookup_customer_profile", {}, result)
+        masked_fields = ["account_id", "last_name"]
+    result, pii_flags = guardrails.mask_fetched_data(result)
+    masked_fields += pii_flags
+    await dashboard_bridge.broadcast_tool_call("lookup_customer_profile", {}, result, masked_fields=masked_fields)
     return result
 
 
@@ -406,7 +420,8 @@ async def check_recent_transactions() -> str:
         for t in _store.transactions
     ]
     result = "Recent transactions:\n" + "\n".join(lines)
-    await dashboard_bridge.broadcast_tool_call("check_recent_transactions", {}, result)
+    result, masked_fields = guardrails.mask_fetched_data(result)
+    await dashboard_bridge.broadcast_tool_call("check_recent_transactions", {}, result, masked_fields=masked_fields)
     return result
 
 
@@ -421,7 +436,8 @@ async def check_credit_card_bill() -> str:
             f"Credit card — limit=${c.cc_limit:,.2f}, balance_due=${c.cc_balance_due:,.2f}, "
             f"minimum_payment=${c.cc_min_payment:,.2f}, due_date={c.cc_due_date or 'n/a'}"
         )
-    await dashboard_bridge.broadcast_tool_call("check_credit_card_bill", {}, result)
+    result, masked_fields = guardrails.mask_fetched_data(result)
+    await dashboard_bridge.broadcast_tool_call("check_credit_card_bill", {}, result, masked_fields=masked_fields)
     return result
 
 
@@ -441,7 +457,8 @@ async def block_card(reason: str) -> str:
         _store.tickets.append({"ticket_id": ticket_id, "summary": f"Card frozen: {reason}", "priority": "high"})
         c.open_tickets += 1
         result = f"Card frozen (ticket {ticket_id}). No new charges can post until it's unfrozen or a replacement is issued."
-    await dashboard_bridge.broadcast_tool_call("block_card", {"reason": reason}, result)
+    result, masked_fields = guardrails.mask_fetched_data(result)
+    await dashboard_bridge.broadcast_tool_call("block_card", {"reason": reason}, result, masked_fields=masked_fields)
     return result
 
 
@@ -466,7 +483,8 @@ async def request_upi_limit_increase(new_limit: float) -> str:
             f"${new_limit:,.2f}. This goes through standard review, not applied on this call -- "
             f"tell the customer to expect a decision within 24-48 hours."
         )
-    await dashboard_bridge.broadcast_tool_call("request_upi_limit_increase", {"new_limit": new_limit}, result)
+    result, masked_fields = guardrails.mask_fetched_data(result)
+    await dashboard_bridge.broadcast_tool_call("request_upi_limit_increase", {"new_limit": new_limit}, result, masked_fields=masked_fields)
     return result
 
 
@@ -481,11 +499,27 @@ async def request_upi_limit_increase(new_limit: float) -> str:
 _pending_transfers: dict[str, dict] = {}
 _transfer_seq = 500
 
+# Data-privacy guardrail for the transfer flow: the LLM (and therefore the
+# chat/voice transcript) must never see or say a recipient's real account
+# number. find_contact hands out a short-lived opaque reference instead
+# (same shape as transfer_id below) that maps server-side to the real
+# account -- initiate_transfer takes that reference, not the account number,
+# so the real digits never have to round-trip through the model at all, not
+# even redacted-then-reconstructed.
+_contact_refs: dict[str, str] = {}
+_contact_ref_seq = 0
+
 
 def _next_transfer_id() -> str:
     global _transfer_seq
     _transfer_seq += 1
     return f"TRF-{_transfer_seq}"
+
+
+def _next_contact_ref() -> str:
+    global _contact_ref_seq
+    _contact_ref_seq += 1
+    return f"CT-{_contact_ref_seq}"
 
 
 def _account_id_to_user_id(account_id: str) -> int | None:
@@ -504,45 +538,74 @@ async def find_contact(name: str) -> str:
     """Look up a registered AdaptiveCX customer by name before transferring money to them --
     ALWAYS call this first for any transfer. Transfers can only go to another real customer with
     an account here, never an arbitrary external payee. Read the result back to the customer to
-    confirm it's the right person before calling initiate_transfer; if more than one match comes
-    back, ask the customer which one (by account ID) rather than guessing."""
+    confirm it's the right person before calling initiate_transfer -- pass the reference ID from
+    this result (e.g. 'CT-3'), never an account number, since account numbers are always masked
+    here and can't be used directly. If more than one match comes back, ask the customer which one
+    (by name) rather than guessing."""
     if not _store.customer.identity_verified:
         result = "Cannot look up a contact: identity has not been verified yet. Call verify_identity first."
         await dashboard_bridge.broadcast_tool_call("find_contact", {"name": name}, result)
         return result
 
     matches = storage.search_users_by_name(name, exclude_user_id=_current_user_id)
+    masked_fields: list[str] = []
     if not matches:
         result = f"No registered AdaptiveCX customer found named '{name}'. Transfers can only be sent to another customer with an account here."
     elif len(matches) == 1:
         uid = matches[0]["user_id"]
         account_id = banking_data.build_account(uid).account_id
-        result = f"Found: {matches[0]['display_name']}, account {account_id}. Confirm this is the right person with the customer before transferring."
+        ref = _next_contact_ref()
+        _contact_refs[ref] = account_id
+        # Data-privacy guardrail: the LLM only ever sees the masked account
+        # number (for reading back to the customer) plus an opaque reference
+        # to actually act on -- the real account_id stays server-side in
+        # _contact_refs and is never spoken, shown, or sent to the model.
+        result = (
+            f"Found: {guardrails.mask_name(matches[0]['display_name'])}, account "
+            f"{guardrails.mask_account_id(account_id)} (reference {ref}). Confirm this is the "
+            f"right person with the customer, then call initiate_transfer with "
+            f"recipient_reference='{ref}'."
+        )
+        masked_fields = ["recipient_last_name", "recipient_account_id"]
     else:
         lines = []
         for m in matches:
             account_id = banking_data.build_account(m["user_id"]).account_id
-            lines.append(f"{m['display_name']} — account {account_id}")
+            ref = _next_contact_ref()
+            _contact_refs[ref] = account_id
+            lines.append(
+                f"{guardrails.mask_name(m['display_name'])} — account "
+                f"{guardrails.mask_account_id(account_id)} (reference {ref})"
+            )
         result = (
             f"Multiple customers named '{name}' found:\n" + "\n".join(lines) +
-            "\nAsk the customer which account (or more of the name) to narrow it down -- do not guess."
+            "\nAsk the customer which one (by name) to narrow it down -- do not guess. Then call "
+            "initiate_transfer with that person's reference."
         )
-    await dashboard_bridge.broadcast_tool_call("find_contact", {"name": name}, result)
+        masked_fields = ["recipient_last_name", "recipient_account_id"]
+    result, pii_flags = guardrails.mask_fetched_data(result)
+    masked_fields += pii_flags
+    await dashboard_bridge.broadcast_tool_call("find_contact", {"name": name}, result, masked_fields=masked_fields)
     return result
 
 
 @function_tool
-async def initiate_transfer(recipient_account_id: str, amount: float) -> str:
-    """Start a money transfer to a registered customer's account ID (from find_contact's result)
-    -- call find_contact first in every case. This only HOLDS the transfer; no money moves here.
-    Read the amount and recipient back to the customer and get an explicit yes/no, then call
-    confirm_transfer with their answer."""
+async def initiate_transfer(recipient_reference: str, amount: float) -> str:
+    """Start a money transfer to a registered customer found via find_contact -- call find_contact
+    first in every case and pass the reference ID it returned (e.g. 'CT-3') here, never an account
+    number directly. This only HOLDS the transfer; no money moves here. Read the amount and
+    recipient's name back to the customer and get an explicit yes/no, then call confirm_transfer
+    with their answer."""
     if not _store.customer.identity_verified:
         result = "Cannot start a transfer: identity has not been verified yet. Call verify_identity first."
-        await dashboard_bridge.broadcast_tool_call("initiate_transfer", {"recipient_account_id": recipient_account_id, "amount": amount}, result)
+        await dashboard_bridge.broadcast_tool_call("initiate_transfer", {"recipient_reference": recipient_reference, "amount": amount}, result)
         return result
 
-    if amount <= 0:
+    recipient_account_id = _contact_refs.get(recipient_reference.strip().upper())
+    masked_fields: list[str] = []
+    if recipient_account_id is None:
+        result = f"'{recipient_reference}' isn't a valid contact reference. Call find_contact to look up the recipient first."
+    elif amount <= 0:
         result = "Transfer amount must be greater than zero."
     elif amount > _store.customer.balance:
         result = f"Cannot transfer ${amount:,.2f} -- balance is only ${_store.customer.balance:,.2f}."
@@ -550,7 +613,7 @@ async def initiate_transfer(recipient_account_id: str, amount: float) -> str:
         recipient_user_id = _account_id_to_user_id(recipient_account_id)
         recipient = storage.get_display_name(recipient_user_id) if recipient_user_id is not None else None
         if recipient is None:
-            result = f"'{recipient_account_id}' isn't a registered customer account. Call find_contact to look up the right account ID first."
+            result = f"Contact reference '{recipient_reference}' no longer resolves to a registered account. Call find_contact again."
         elif recipient_user_id == _current_user_id:
             result = "Cannot transfer to your own account."
         else:
@@ -562,12 +625,21 @@ async def initiate_transfer(recipient_account_id: str, amount: float) -> str:
                 "recipient_account_id": recipient_account_id,
                 "amount": amount,
             }
+            # The real account number never appears in this LLM-facing text --
+            # only the masked form, same guardrail as find_contact.
             result = (
-                f"Transfer {transfer_id} ready: ${amount:,.2f} to {recipient} ({recipient_account_id}). "
-                f"NOT sent yet. Read this back to the customer and ask them to explicitly confirm "
-                f"yes or no, then call confirm_transfer with transfer_id='{transfer_id}' and their answer."
+                f"Transfer {transfer_id} ready: ${amount:,.2f} to {guardrails.mask_name(recipient)} "
+                f"({guardrails.mask_account_id(recipient_account_id)}). NOT sent yet. Read this back "
+                f"to the customer and ask them to explicitly confirm yes or no, then call "
+                f"confirm_transfer with transfer_id='{transfer_id}' and their answer."
             )
-    await dashboard_bridge.broadcast_tool_call("initiate_transfer", {"recipient_account_id": recipient_account_id, "amount": amount}, result)
+            masked_fields = ["recipient_last_name", "recipient_account_id"]
+    result, pii_flags = guardrails.mask_fetched_data(result)
+    masked_fields += pii_flags
+    await dashboard_bridge.broadcast_tool_call(
+        "initiate_transfer", {"recipient_reference": recipient_reference, "amount": amount}, result,
+        masked_fields=masked_fields,
+    )
     return result
 
 
@@ -576,6 +648,7 @@ async def confirm_transfer(transfer_id: str, confirm: bool) -> str:
     """Finish a transfer started by initiate_transfer. Only call this after the customer has
     explicitly said yes or no out loud -- never assume. confirm=False cancels it, nothing moves.
     confirm=True actually moves the money; this is the only tool that does."""
+    masked_fields: list[str] = []
     pending = _pending_transfers.get(transfer_id)
     if pending is None:
         result = f"No pending transfer found with ID {transfer_id} -- it may have already been completed or cancelled."
@@ -594,6 +667,11 @@ async def confirm_transfer(transfer_id: str, confirm: bool) -> str:
             sender_id = pending["sender_user_id"]
             recipient_id = pending["recipient_user_id"]
             _store.customer.balance -= amount
+            # Full names are fine in the DB-backed transaction history below
+            # (that's each account holder's own private record, read only by
+            # them via storage/auth_server, never handed to the LLM) -- the
+            # data-privacy guardrail only applies to what gets returned to
+            # Gemini in `result`, masked further down.
             storage.save_balance_adjustment(sender_id, -amount, reason=f"Transfer to {pending['recipient_name']}", counterparty_user_id=recipient_id, transfer_id=transfer_id)
             storage.save_balance_adjustment(recipient_id, amount, reason=f"Transfer from {_store.customer.full_name}", counterparty_user_id=sender_id, transfer_id=transfer_id)
             new_txn = Transaction(
@@ -611,10 +689,18 @@ async def confirm_transfer(transfer_id: str, confirm: bool) -> str:
                 _store.customer.balance, reason=f"Sent ${amount:,.2f} to {pending['recipient_name']}",
             )
             result = (
-                f"Transfer {transfer_id} complete: ${amount:,.2f} sent to {pending['recipient_name']} "
-                f"({pending['recipient_account_id']}). New balance: ${_store.customer.balance:,.2f}."
+                f"Transfer {transfer_id} complete: ${amount:,.2f} sent to "
+                f"{guardrails.mask_name(pending['recipient_name'])} "
+                f"({guardrails.mask_account_id(pending['recipient_account_id'])}). "
+                f"New balance: ${_store.customer.balance:,.2f}."
             )
-    await dashboard_bridge.broadcast_tool_call("confirm_transfer", {"transfer_id": transfer_id, "confirm": confirm}, result)
+            masked_fields = ["recipient_last_name", "recipient_account_id"]
+    result, pii_flags = guardrails.mask_fetched_data(result)
+    masked_fields += pii_flags
+    await dashboard_bridge.broadcast_tool_call(
+        "confirm_transfer", {"transfer_id": transfer_id, "confirm": confirm}, result,
+        masked_fields=masked_fields,
+    )
     return result
 
 
@@ -875,7 +961,8 @@ async def dispute_transaction(transaction_id: str, reason: str) -> str:
                 f"Transactions panel; do not tell the customer it's approved or that a refund is "
                 f"coming until you see that decision (call check_recent_transactions to check)."
             )
-    await dashboard_bridge.broadcast_tool_call("dispute_transaction", {"transaction_id": transaction_id, "reason": reason}, result)
+    result, masked_fields = guardrails.mask_fetched_data(result)
+    await dashboard_bridge.broadcast_tool_call("dispute_transaction", {"transaction_id": transaction_id, "reason": reason}, result, masked_fields=masked_fields)
     return result
 
 
@@ -908,7 +995,8 @@ async def process_refund(transaction_id: str) -> str:
                 note=f"Refund {refund_id} of ${txn.amount:.2f} issued. Funds return in 3-5 business days.",
             )
             result = f"Refund {refund_id} of ${txn.amount:.2f} issued for {transaction_id}. Funds return in 3-5 business days."
-    await dashboard_bridge.broadcast_tool_call("process_refund", {"transaction_id": transaction_id}, result)
+    result, masked_fields = guardrails.mask_fetched_data(result)
+    await dashboard_bridge.broadcast_tool_call("process_refund", {"transaction_id": transaction_id}, result, masked_fields=masked_fields)
     return result
 
 
@@ -919,7 +1007,8 @@ async def create_support_ticket(summary: str, priority: str = "normal") -> str:
     _store.tickets.append({"ticket_id": ticket_id, "summary": summary, "priority": priority})
     _store.customer.open_tickets += 1
     result = f"Ticket {ticket_id} created (priority={priority}): {summary}"
-    await dashboard_bridge.broadcast_tool_call("create_support_ticket", {"summary": summary, "priority": priority}, result)
+    result, masked_fields = guardrails.mask_fetched_data(result)
+    await dashboard_bridge.broadcast_tool_call("create_support_ticket", {"summary": summary, "priority": priority}, result, masked_fields=masked_fields)
     return result
 
 
@@ -978,10 +1067,12 @@ async def escalate_to_specialist(summary: str, reason: str, transaction_id: str 
             note=f"Escalated to a human specialist -- ticket {ticket_id}, meeting {meeting_day} at {slot}.",
         )
 
+    result, masked_fields = guardrails.mask_fetched_data(result)
     await dashboard_bridge.broadcast_tool_call(
         "escalate_to_specialist",
         {"summary": summary, "reason": reason, "transaction_id": transaction_id},
         result,
+        masked_fields=masked_fields,
     )
     return result
 

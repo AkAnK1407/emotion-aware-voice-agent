@@ -235,7 +235,7 @@
         </div>
       </div>
       <div style="margin-top:8px; font-size:11px; color:#9ca3af;">
-        Voice emotion: <span id="voiceEmotionValue">—</span> — computed from audio only (Stage 1 + Stage 2 models), shown for comparison. Not used for the agent's actual response.
+        Voice emotion: <span id="voiceEmotionValue">—</span> — computed from audio only (Stage 1 + Stage 2 models). Races against the text-based signal above every turn: when it finishes within the deadline, it drives the agent's actual response (see the VOICE/TEXT badge above); otherwise the text-based signal is used instead so the agent never waits.
       </div>
     </div>
 
@@ -398,6 +398,21 @@
         <span class="badge badge-neutral" id="guardOutputBadge">—</span>
       </div>
       <div class="badge-reason" id="guardOutputReason">Waiting for response...</div>
+    </div>
+
+    <!-- Data Privacy -->
+    <div class="card">
+      <div class="card-label">🔒 DATA PRIVACY</div>
+      <div class="badge-row">
+        <span class="badge-label">Your data</span>
+        <span class="badge badge-pass" id="privacyBadge">PROTECTED</span>
+      </div>
+      <div class="badge-reason" id="privacyReason">
+        Account numbers, last names, and other personal details are masked
+        before any account data reaches the AI model — it only ever sees
+        what it needs to answer you.
+      </div>
+      <div class="privacy-feed" id="privacyFeed"></div>
     </div>
 
     <!-- Knowledge Retrieval -->

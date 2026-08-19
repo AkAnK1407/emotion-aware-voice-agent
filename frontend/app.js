@@ -16,12 +16,12 @@ const LIVEKIT_URL = "wss://voice-agent-2y77bxoc.livekit.cloud";
 // Backend (agent worker + dashboard WS + /token) hostname when not running
 // locally. Update this whenever you restart the Cloudflare Tunnel / redeploy
 // to Render — quick tunnels get a new random hostname each run.
-const BACKEND_HOST = "kernel-thereafter-counsel-softball.trycloudflare.com";
+const BACKEND_HOST = "messaging-kingston-floors-anatomy.trycloudflare.com";
 
 // Login/signup/history API (auth_server.py) — separate service, separate
 // tunnel, since dashboard_bridge's server can't accept anything but a
 // bodyless GET. Same "update after restarting the tunnel" caveat as above.
-const AUTH_HOST = "thats-medicines-managed-mid.trycloudflare.com";
+const AUTH_HOST = "outlined-throws-hear-coming.trycloudflare.com";
 
 const IS_LOCAL = location.hostname === "localhost" || location.hostname === "127.0.0.1";
 const DASHBOARD_WS = IS_LOCAL ? "ws://localhost:8765" : `wss://${BACKEND_HOST}/`;
@@ -132,6 +132,9 @@ const guardInputBadge = document.getElementById("guardInputBadge");
 const guardInputReason = document.getElementById("guardInputReason");
 const guardOutputBadge = document.getElementById("guardOutputBadge");
 const guardOutputReason = document.getElementById("guardOutputReason");
+const privacyBadge = document.getElementById("privacyBadge");
+const privacyReason = document.getElementById("privacyReason");
+const privacyFeed = document.getElementById("privacyFeed");
 const kbBadge = document.getElementById("kbBadge");
 const kbBody = document.getElementById("kbBody");
 const evalResolutionBadge = document.getElementById("evalResolutionBadge");
@@ -563,9 +566,11 @@ function handleDashboardEvent(data) {
       break;
 
     case "voice_cx":
-      // Experimental / shadow mode: voice-only signal (Stage 1 + Stage 2),
-      // shown for comparison against the text-based cards above it. Never
-      // drives the agent's actual response.
+      // Voice-only signal (Stage 1 + Stage 2). Races the text-based signal
+      // every turn (see agent.py's RACE_TIMEOUT) -- when it wins, it's what
+      // actually drove this turn's policy/response (behaviorSourceBadge
+      // above flips to "VOICE"); when it doesn't finish in time, the
+      // text-based fallback drove the turn instead.
       voiceStressValue.textContent = pct(data.stress);
       voiceFrustrationValue.textContent = pct(data.frustration);
       voiceUrgencyValue.textContent = pct(data.urgency);
@@ -598,14 +603,47 @@ function handleToolCall(data) {
   const argsStr = Object.keys(data.arguments || {}).length
     ? JSON.stringify(data.arguments)
     : "";
+  const maskedFields = data.masked_fields || [];
   entry.innerHTML = `
     <div class="tool-entry-name">⚡ ${data.tool_name}${argsStr ? " " + argsStr : ""}</div>
     <div class="tool-entry-result"></div>`;
   entry.querySelector(".tool-entry-result").textContent = data.result;
+  if (maskedFields.length) {
+    const pill = document.createElement("div");
+    pill.className = "tool-entry-masked";
+    pill.textContent = "🔒 masked: " + maskedFields.join(", ");
+    entry.appendChild(pill);
+  }
   toolFeed.prepend(entry);
 
   while (toolFeed.children.length > 6) {
     toolFeed.removeChild(toolFeed.lastChild);
+  }
+
+  if (maskedFields.length) {
+    handlePrivacyMask(data.tool_name, maskedFields);
+  }
+}
+
+function handlePrivacyMask(toolName, maskedFields) {
+  const placeholder = privacyFeed.querySelector(".privacy-placeholder");
+  if (placeholder) placeholder.remove();
+
+  setBadge(privacyBadge, "MASKED " + maskedFields.length, "pass");
+  privacyReason.textContent =
+    `Before "${toolName}" reached the AI model, these fields were redacted: ${maskedFields.join(", ")}.`;
+
+  const entry = document.createElement("div");
+  entry.className = "privacy-entry";
+  entry.innerHTML = `
+    <div class="privacy-entry-tool">🔒 ${toolName}</div>
+    <div class="privacy-entry-fields"></div>`;
+  entry.querySelector(".privacy-entry-fields").textContent =
+    "Redacted before reaching the LLM: " + maskedFields.join(", ");
+  privacyFeed.prepend(entry);
+
+  while (privacyFeed.children.length > 5) {
+    privacyFeed.removeChild(privacyFeed.lastChild);
   }
 }
 

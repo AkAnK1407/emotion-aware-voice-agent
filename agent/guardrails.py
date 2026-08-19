@@ -104,6 +104,60 @@ def check_input(text: str) -> GuardrailResult:
     return GuardrailResult(passed=True, category="clean", redacted_text=text)
 
 
+def mask_name(full_name: str) -> str:
+    """Mask every part of the name after the first before it's returned to
+    the LLM as fetched CRM data -- first name stays so the agent can still
+    address the caller naturally, the rest becomes an initial + asterisks
+    (e.g. "Sarah Chen" -> "Sarah C***")."""
+    parts = full_name.strip().split()
+    if len(parts) <= 1:
+        return full_name.strip()
+    first, rest = parts[0], parts[1:]
+    masked_rest = " ".join(f"{p[0].upper()}{'*' * max(len(p) - 1, 1)}" for p in rest)
+    return f"{first} {masked_rest}"
+
+
+_ACCOUNT_ID_RE = re.compile(r"^([A-Za-z]+-?)(\d+)$")
+
+
+def mask_account_id(account_id: str) -> str:
+    """Mask all but the last 2 digits of an account number before it's
+    returned to the LLM (e.g. "AC-10293" -> "AC-***93") -- the model needs
+    the account exists and its balance, not the exact number."""
+    m = _ACCOUNT_ID_RE.match(account_id.strip())
+    if not m:
+        return account_id
+    prefix, digits = m.groups()
+    if len(digits) <= 2:
+        return f"{prefix}{'*' * len(digits)}"
+    return f"{prefix}{'*' * (len(digits) - 2)}{digits[-2:]}"
+
+
+DOB_PLACEHOLDER = "[REDACTED_DOB]"
+PASSWORD_PATTERN = re.compile(r"\b(password|pwd|passcode)\s*[:=]\s*\S+", re.IGNORECASE)
+
+
+def mask_dob(date_of_birth: str) -> str:
+    """Fully redact a date of birth before it's returned to the LLM as
+    fetched CRM data -- unlike name/account there's no natural-language need
+    for the model to ever see the real value here."""
+    return DOB_PLACEHOLDER if date_of_birth.strip() else date_of_birth
+
+
+def mask_fetched_data(text: str) -> tuple[str, list[str]]:
+    """Guardrail checkpoint for data fetched from the CRM/banking store
+    (account lookups, balances, transactions) before it's handed to the LLM
+    as a tool result. Catches card/SSN/email/phone (shared with the input/
+    output checkpoints) plus password-style strings. Name and account ID are
+    masked separately at the call site (mask_name / mask_account_id /
+    mask_dob) since those need custom, not blanket, redaction."""
+    redacted, flags = _redact_pii(text)
+    if PASSWORD_PATTERN.search(redacted):
+        redacted = PASSWORD_PATTERN.sub(lambda m: f"{m.group(1)}: [REDACTED_PASSWORD]", redacted)
+        flags.append("password")
+    return redacted, flags
+
+
 def check_output(text: str) -> GuardrailResult:
     """Run on the LLM's draft reply before it is sent to TTS."""
     if UNSAFE_OUTPUT_REGEX.search(text):

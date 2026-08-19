@@ -325,13 +325,21 @@ async def broadcast_tts_params(params: dict):
     })
 
 
-async def broadcast_tool_call(tool_name: str, arguments: dict, result: str):
-    """Send a completed agentic tool call (CRM/refund/ticket/etc.) to the dashboard."""
+async def broadcast_tool_call(tool_name: str, arguments: dict, result: str, masked_fields: list[str] | None = None):
+    """Send a completed agentic tool call (CRM/refund/ticket/etc.) to the dashboard.
+
+    masked_fields: names of PII fields (e.g. "account_id", "last_name", "dob")
+    that were redacted out of `result` by the data-privacy guardrail
+    (guardrails.mask_*) before it was handed to the LLM -- `result` here is
+    already the masked text, exactly what the model saw, so the dashboard's
+    tool feed shows the same protection live rather than a separate copy.
+    """
     await broadcast({
         "type": "tool_call",
         "tool_name": tool_name,
         "arguments": arguments,
         "result": result,
+        "masked_fields": masked_fields or [],
     })
 
 
