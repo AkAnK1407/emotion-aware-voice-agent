@@ -126,18 +126,69 @@ async def history(authorization: str | None = Header(default=None)):
 
 @app.get("/transactions")
 async def transactions(authorization: str | None = Header(default=None)):
-    """This account's 5 mock transactions (see banking_data.py) -- same data
-    the agent's check_recent_transactions tool sees on a call, computed the
-    same deterministic way, just called from the dashboard's HTTP API
-    instead of from inside a call."""
+    """This account's 5 mock transactions (see banking_data.py) -- same base
+    data the agent's check_recent_transactions tool sees on a call, computed
+    the same deterministic way -- overlaid with whatever actually happened to
+    each one on a real call (dispute opened, review team decision, refund
+    issued, escalated), read back from storage.py's transaction_events log so
+    this stays accurate after the call ends, not just live during it."""
     user_id = await _require_user(authorization)
-    account = await asyncio.to_thread(banking_data.build_account, user_id)
+    account, overrides, events, identity, adjustments_total = await asyncio.gather(
+        asyncio.to_thread(banking_data.build_account, user_id),
+        asyncio.to_thread(storage.get_transaction_status_overrides, user_id),
+        asyncio.to_thread(storage.get_transaction_events, user_id),
+        asyncio.to_thread(storage.get_verified_identity, user_id),
+        asyncio.to_thread(storage.get_balance_adjustments_total, user_id),
+    )
+    events_by_txn: dict[str, list[dict]] = {}
+    for e in events:
+        events_by_txn.setdefault(e["transaction_id"], []).append(e)
+
+    txns = []
+    for t in account.transactions:
+        row = vars(t)
+        override = overrides.get(t.transaction_id)
+        if override:
+            row = {
+                **row,
+                "status": override["status"],
+                "reason": override["reason"],
+                "decided_by": override["decided_by"],
+                "note": override["note"],
+                "updated_at": override["created_at"],
+            }
+        row["history"] = events_by_txn.get(t.transaction_id, [])
+        txns.append(row)
+
     return {
         "account_id": account.account_id,
         "tier": account.tier,
-        "balance": account.balance,
-        "transactions": [vars(t) for t in account.transactions],
+        "balance": account.balance + adjustments_total,
+        "full_name": identity.full_name if identity else None,
+        "date_of_birth": identity.date_of_birth if identity else None,
+        "transactions": txns,
     }
+
+
+@app.get("/contacts")
+async def contacts(authorization: str | None = Header(default=None)):
+    """Every other registered customer, for the dashboard's Contacts panel --
+    the same set agent/tools.py:find_contact searches when the customer asks
+    to transfer money. Shows name, DOB, and account ID so the customer can
+    positively identify who they're about to send money to before confirming."""
+    user_id = await _require_user(authorization)
+    users = await asyncio.to_thread(storage.list_all_users, user_id)
+
+    async def _row(u: dict) -> dict:
+        identity = await asyncio.to_thread(storage.get_verified_identity, u["user_id"])
+        return {
+            "display_name": u["display_name"],
+            "date_of_birth": identity.date_of_birth if identity else None,
+            "account_id": banking_data.build_account(u["user_id"]).account_id,
+        }
+
+    rows = await asyncio.gather(*(_row(u) for u in users))
+    return {"contacts": list(rows)}
 
 
 @app.get("/health")

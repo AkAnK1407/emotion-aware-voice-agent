@@ -33,6 +33,7 @@
       <span class="account-name" id="accountName" style="display:none;"></span>
       <button class="btn-chip" id="historyBtn" style="display:none;">🕐 History</button>
       <button class="btn-chip" id="transactionsBtn" style="display:none;">🧾 Transactions</button>
+      <button class="btn-chip" id="contactsBtn" style="display:none;">👥 Contacts</button>
       <button class="btn-chip" id="loginOpenBtn">👤 Log in</button>
       <button class="btn-chip" id="logoutBtn" style="display:none;">Log out</button>
     </div>
@@ -82,6 +83,18 @@
     <button class="auth-close" id="transactionsCloseBtn" aria-label="Close">✕</button>
   </div>
   <div class="history-body" id="transactionsBody">
+    <div class="history-placeholder">Loading…</div>
+  </div>
+</div>
+
+<!-- ── CONTACTS PANEL ─────────────────────────────────────────────────────────────── -->
+<div class="history-backdrop hidden" id="contactsBackdrop"></div>
+<div class="history-panel hidden" id="contactsPanel">
+  <div class="history-header">
+    <span>👥 Transfer Contacts</span>
+    <button class="auth-close" id="contactsCloseBtn" aria-label="Close">✕</button>
+  </div>
+  <div class="history-body" id="contactsBody">
     <div class="history-placeholder">Loading…</div>
   </div>
 </div>

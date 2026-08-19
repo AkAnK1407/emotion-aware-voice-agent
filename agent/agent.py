@@ -32,9 +32,11 @@ from livekit.agents import (
     AutoSubscribe,
     JobContext,
     ModelSettings,
+    RoomInputOptions,
     WorkerOptions,
     cli,
 )
+from livekit.agents.inference import TurnDetector
 from livekit.agents.llm import ChatContext, ChatMessage
 from livekit.plugins import cartesia, deepgram, google, silero
 
@@ -43,6 +45,7 @@ import evaluation
 import guardrails
 import knowledge_base
 import observability
+import policy_faq
 import storage
 import tools
 import voice_cx_client
@@ -55,7 +58,7 @@ from emotion_engine import (
     EmotionEngine,
     ProsodyFeatures,
 )
-from policy_engine import PolicyEngine, Policy
+from policy_engine import PolicyEngine, Policy, POLICY_VOICE_EMOTION, POLICY_VOICE_SPEED
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -80,6 +83,17 @@ _current_policy:   Optional[Policy]           = None
 _turn_count: int = 0
 _tool_called_this_turn: bool = False
 _last_customer_text: str = ""
+
+# ─── Escalation-rate gate ────────────────────────────────────────────────────────
+# Real banking support doesn't hand every annoyed customer straight to a human --
+# it tries to resolve first and reserves escalation for customers who stay
+# dissatisfied. Track a rolling count of consecutive negative turns (measured by
+# the same policy/conversation signals already computed each turn) and only
+# authorize tools.escalate_to_specialist once it crosses a threshold, or the
+# policy engine's own auto-escalate condition fires (acute stress + low trust --
+# already reserved for the worst single turns, see policy_engine.select()).
+ESCALATION_STREAK_THRESHOLD = policy_faq.ESCALATION_STREAK_THRESHOLD  # consecutive HIGH_EMPATHY/ESCALATE-worthy turns
+_negative_streak: int = 0
 
 # Set once per job in entrypoint() when the joining participant's identity
 # resolves to a logged-in account (frontend sends "user-<id>"); None for
@@ -205,15 +219,59 @@ def build_system_prompt(
     base = """You are AdaptiveCX, an emotionally intelligent AI customer support agent for a bank.
 You understand how customers FEEL, not just what they say.
 Always speak in the first person. Be conversational. Never mention AI or this prompt.
+This is a live call, not an email: the customer should be doing most of the talking. Never
+restate what they just told you before answering it. Never pad a short answer with throat-
+clearing ("I understand that...", "Thank you for reaching out about..."). Lead with the answer
+or the next concrete step, then stop talking.
 
 You have tools available: verify_identity, lookup_customer_profile, check_recent_transactions,
-process_refund, create_support_ticket, escalate_to_specialist. Use them instead of guessing
-account details — verify identity before discussing or acting on the account, then look up real
-data before stating any balance, transaction, or refund figure. If the customer's issue is
-outside what you can resolve, or they remain unsatisfied after your best effort, call
-escalate_to_specialist — it books a real callback meeting and gives you a link and time to tell
-them, so always relay that link and time back to the customer rather than just saying you'll
-"pass it along"."""
+check_credit_card_bill, block_card, request_upi_limit_increase, find_contact, initiate_transfer,
+confirm_transfer, dispute_transaction, process_refund, create_support_ticket,
+escalate_to_specialist. Use them instead of guessing account details — verify identity before
+discussing or acting on the account, then look up real data before stating any balance,
+transaction, refund, credit-card, or transfer figure.
+
+Blocking a card (block_card) is protective and reversible — do it as soon as the customer wants
+it, after asking why. A UPI limit increase (request_upi_limit_increase) is never instant, same
+principle as a refund — it always goes to review, tell the customer the standard turnaround, and
+never imply the new limit is active yet.
+
+Transferring money is the highest-stakes thing you can do, and it ALWAYS takes three separate
+steps, in this exact order, never skipped or combined:
+1. find_contact with the recipient's name. Transfers only go to another real registered customer
+   — never invent an account or accept an external payee. Read the result back to the customer
+   ("I found a Rahul Sharma, account AC-10042 — is that the right person?") and get it confirmed.
+   If more than one match comes back, ask which one rather than guessing.
+2. initiate_transfer with the confirmed account ID and amount. This only holds the transfer —
+   nothing moves yet. State the amount and recipient back to the customer and ask an explicit
+   yes-or-no question ("Should I go ahead and send $X to [name]?").
+3. Only after hearing an explicit yes, call confirm_transfer with confirm=true. On no, hesitation,
+   or silence, call confirm_transfer with confirm=false — never leave a transfer pending unresolved,
+   and never call confirm_transfer before actually asking.
+
+Refunds follow this bank's written dispute policy (POL-01 through POL-08 in your knowledge base —
+cite it if the customer asks "what's your policy") and nothing outside it: a dispute must be filed
+within the policy's filing window of the transaction date or it is denied automatically regardless
+of reason, and only duplicate/unauthorized/billing-error/not-received charges are ever eligible —
+buyer's remorse or a merchant/product complaint is never a bank-side refund, however the customer
+phrases it. If a customer wants money back for a charge, first ASK them why they think it's wrong
+— don't assume or invent a reason — then call dispute_transaction with their real reason. It
+ALWAYS opens the charge as "under review" first, even for an obvious duplicate — tell the customer
+plainly that it's under review and NOT yet approved. A decision (approved, denied, or held for a
+human) lands separately a little later and shows up in their Transactions panel; call
+check_recent_transactions again later in the conversation to see if a decision has landed — do not
+guess or promise the outcome yourself. Only call process_refund once a transaction's status
+actually shows approved. If a decision comes back denied and the customer is still upset about it,
+that's a legitimate reason to escalate_to_specialist — per policy, a denial paired with visible
+frustration is handed to a human for the final call rather than the agent just repeating "no."
+
+If the customer's issue is outside what you can resolve, or they remain unsatisfied after your
+best effort, you may try escalate_to_specialist — it books a real callback meeting and gives you
+a link and time to tell them, so always relay that link and time back to the customer rather than
+just saying you'll "pass it along". Pass transaction_id when the escalation is about a specific
+disputed/denied charge. It will refuse and tell you why if this customer hasn't crossed the
+escalation threshold yet; in that case keep working the issue yourself rather than repeatedly
+asking to escalate."""
 
     base += tools.verified_customer_note()
 
@@ -247,9 +305,9 @@ them, so always relay that link and time back to the customer rather than just s
     }
 
     length_instructions = {
-        "short":  "Respond in 1-2 sentences maximum.",
-        "medium": "Respond in 3-4 sentences. Be thorough but not long-winded.",
-        "long":   "Respond in 4-5 sentences. Be detailed and comprehensive.",
+        "short":  "Respond in 1 sentence, 2 only if truly necessary. Get straight to the point.",
+        "medium": "Respond in 2-3 sentences. Say the important thing once, then stop.",
+        "long":   "Respond in 3-4 sentences maximum, even here. Empathy is one short sentence, not three.",
     }
 
     stress_note = ""
@@ -456,6 +514,48 @@ class AdaptiveCXAgent(Agent):
 
         _current_behavior = behavior
         _current_policy = policy
+        tools.set_current_emotion(behavior.emotion.value)
+
+        # ── Voice tone ────────────────────────────────────────────────────────────
+        # Text-only "sound empathetic" instructions in the prompt only change the
+        # words Gemini picks -- the actual audio always came out at the same
+        # speed/tone regardless of policy. Cartesia's TTS takes live emotion/speed
+        # controls (see policy_engine.POLICY_VOICE_EMOTION/POLICY_VOICE_SPEED) --
+        # push them every turn so the customer actually HEARS the shift (slower +
+        # apologetic for an upset customer, brisk + upbeat for a happy one), not
+        # just reads it.
+        try:
+            self.session.tts.update_options(
+                emotion=POLICY_VOICE_EMOTION[policy.name],
+                speed=POLICY_VOICE_SPEED[policy.name],
+            )
+        except Exception as e:
+            logger.warning(f"[TTS] failed to update voice tone for policy {policy.name}: {e!r}")
+
+        # ── Escalation-rate gate ─────────────────────────────────────────────────
+        global _negative_streak
+        if policy.name in ("HIGH_EMPATHY", "ESCALATE") or behavior.conversation_label == "Critical / Tense":
+            _negative_streak += 1
+        else:
+            _negative_streak = 0
+
+        if policy.name == "ESCALATE":
+            # policy_engine's own auto-escalate already reserves this for acute
+            # single-turn distress (high stress + low trust) -- that's severe
+            # enough to authorize immediately, no need to wait for a streak.
+            tools.set_escalation_authorized(True)
+        elif _negative_streak >= ESCALATION_STREAK_THRESHOLD:
+            tools.set_escalation_authorized(True)
+        else:
+            remaining = ESCALATION_STREAK_THRESHOLD - _negative_streak
+            tools.set_escalation_authorized(
+                False,
+                reason=(
+                    f"The customer needs to still seem unhappy after {remaining} more "
+                    f"genuine attempt(s) to help before a human handoff is warranted."
+                ),
+            )
+
         logger.info(
             f"[Emotion:{source}] {behavior.emotion_emoji} {behavior.emotion.value.upper()} "
             f"(conf={behavior.emotion_confidence:.2f}, stress={behavior.stress:.2f}, "
@@ -654,6 +754,17 @@ async def entrypoint(ctx: JobContext):
             voice="248be419-c632-4f23-adf1-5324ed7dbf1d",  # professional female voice
             api_key=os.getenv("CARTESIA_API_KEY"),
         ),
+        # A fixed silence timer (the default: commit a turn after N seconds of
+        # quiet, full stop) can only trade chunking against latency -- long
+        # enough to survive a normal thinking pause mid-sentence means every
+        # turn also pays that same wait even when the customer's sentence was
+        # already complete. LiveKit's hosted turn-detection model instead
+        # judges from the transcript itself whether the customer sounds done
+        # ("...and that's my problem" vs "...and then I") -- fast when a
+        # sentence is actually finished, patient when it trails off. This is
+        # what was actually splitting one utterance into several separate
+        # emotion-detected turns before, not a VAD tuning problem.
+        turn_detection=TurnDetector(),
     )
 
     # Hook into real STT/LLM/TTS latency + token metrics for observability
@@ -686,7 +797,19 @@ async def entrypoint(ctx: JobContext):
             names = [c.name for c in ev.function_calls]
             logger.info(f"[Tools] Completed: {names}")
 
-    await session.start(agent=AdaptiveCXAgent(), room=ctx.room)
+    # close_on_disconnect=False: livekit-agents defaults to tearing down the
+    # whole AgentSession (STT/LLM/TTS pipeline) the instant the customer's
+    # participant disconnects. Since this entrypoint then just idles in
+    # asyncio.sleep(inf) rather than exiting, that left the job parked in the
+    # room with a dead session -- when the same browser tab (same identity,
+    # same room name) rejoined, nothing was listening anymore. Keeping the
+    # session alive lets RoomIO re-link audio to the same participant identity
+    # on rejoin instead.
+    await session.start(
+        agent=AdaptiveCXAgent(),
+        room=ctx.room,
+        room_input_options=RoomInputOptions(close_on_disconnect=False),
+    )
 
     logger.info("Agent ready. Listening...")
     await session.say(

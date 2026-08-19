@@ -539,6 +539,13 @@ body::before {
   transition: all 0.2s;
 }
 .btn-chip:hover { border-color: rgba(255,255,255,0.2); color: var(--text-primary); }
+.btn-chip.has-update { position: relative; border-color: var(--accent-amber, #f59e0b); color: var(--accent-amber, #f59e0b); }
+.btn-chip.has-update::after {
+  content: ""; position: absolute; top: -2px; right: -2px;
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--accent-amber, #f59e0b);
+  box-shadow: 0 0 0 2px var(--bg-panel, #0b0d14);
+}
 
 /* ── Auth Overlay ───────────────────────────────────────────────────────────── */
 .auth-overlay {
@@ -654,6 +661,15 @@ body::before {
 .history-turn.agent .h-speaker { color: var(--accent-green); }
 .history-turn .h-text { color: var(--text-secondary); margin-top: 2px; }
 .history-turn .h-time { color: var(--text-muted); font-size: 10px; margin-top: 2px; }
+.history-turn .h-detail {
+  margin-top: 6px; padding: 6px 8px; border-radius: 6px;
+  background: rgba(255,255,255,0.03); border: 1px solid var(--border);
+  font-size: 11px; color: var(--text-secondary);
+}
+.history-turn .h-detail-line { margin: 2px 0; }
+.history-turn .h-detail-line b { color: var(--text-primary); font-weight: 600; }
+.history-turn .h-timeline ul { margin: 4px 0 0 16px; padding: 0; }
+.history-turn .h-timeline li { margin: 2px 0; color: var(--text-muted); }
 .history-room-divider {
   font-size: 10px;
   color: var(--text-muted);

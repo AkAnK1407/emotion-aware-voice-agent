@@ -36,6 +36,11 @@ class Account:
     balance: float
     open_tickets: int
     transactions: list[Transaction]
+    upi_limit: float
+    cc_limit: float
+    cc_balance_due: float
+    cc_due_date: str
+    cc_min_payment: float
 
 
 def build_account(user_id: int) -> Account:
@@ -43,6 +48,12 @@ def build_account(user_id: int) -> Account:
     tier = rng.choice(_TIERS)
     balance = round(rng.uniform(400, 12000), 2)
     now = datetime.now()
+
+    upi_limit = round(rng.uniform(25000, 100000), -3)  # nearest $1,000
+    cc_limit = round(rng.uniform(2000, 15000), -2)
+    cc_balance_due = round(rng.uniform(0, cc_limit * 0.6), 2)
+    cc_due_date = (now + timedelta(days=rng.randint(3, 25))).strftime("%Y-%m-%d")
+    cc_min_payment = round(max(cc_balance_due * 0.03, 25.0), 2) if cc_balance_due > 0 else 0.0
 
     txns = []
     for i in range(5):
@@ -56,14 +67,17 @@ def build_account(user_id: int) -> Account:
         ))
     txns.sort(key=lambda t: t.date, reverse=True)
 
-    # ~30% of accounts carry the demo's core storyline: a duplicate charge
-    # the customer needs to dispute.
-    if rng.random() < 0.3:
-        d = txns[0]
-        txns[0] = Transaction(d.transaction_id, d.date, d.merchant, d.amount, "duplicate_flagged")
-        txns[1] = Transaction(txns[1].transaction_id, d.date, d.merchant, d.amount, "duplicate_flagged")
+    # Every account carries the demo's core storyline -- a duplicate charge
+    # (same merchant, same amount, same day) the customer needs to dispute --
+    # so the refund/dispute flow is always testable on login, not a 1-in-3
+    # chance of being there.
+    d = txns[0]
+    txns[0] = Transaction(d.transaction_id, d.date, d.merchant, d.amount, "duplicate_flagged")
+    txns[1] = Transaction(txns[1].transaction_id, d.date, d.merchant, d.amount, "duplicate_flagged")
 
     return Account(
         account_id=f"AC-{10000 + user_id}", tier=tier, balance=balance,
         open_tickets=0, transactions=txns,
+        upi_limit=upi_limit, cc_limit=cc_limit, cc_balance_due=cc_balance_due,
+        cc_due_date=cc_due_date, cc_min_payment=cc_min_payment,
     )

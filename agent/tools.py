@@ -19,6 +19,7 @@ functions passed to `Agent(tools=BANKING_TOOLS)` — the older
 was removed in the 1.0 API redesign.
 """
 
+import asyncio
 import calendar
 import re
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ from livekit.agents import function_tool
 
 import banking_data
 import dashboard_bridge
+import policy_faq
 import storage
 
 # Names + DOB that verify_identity accepts, all mapped onto the one seeded
@@ -183,7 +185,15 @@ class Transaction:
     date: str
     merchant: str
     amount: float
-    status: str          # "posted" | "duplicate_flagged" | "refunded"
+    # "posted" -> normal, no dispute yet
+    # "duplicate_flagged" -> system already detected this as a probable duplicate
+    # "disputed_under_review" -> customer disputed a non-duplicate charge; needs
+    #   a human to actually look at it, can't be auto-approved on this call
+    # "approved_for_refund" -> cleared to refund (duplicate, or review approved it)
+    # "refund_denied" -> reviewed and rejected
+    # "refunded" -> money actually moved
+    status: str
+    dispute_reason: str = ""
 
 
 @dataclass
@@ -195,6 +205,12 @@ class CustomerProfile:
     balance: float
     open_tickets: int
     identity_verified: bool = False
+    card_frozen: bool = False
+    upi_limit: float = 50000.0
+    cc_limit: float = 5000.0
+    cc_balance_due: float = 0.0
+    cc_due_date: str = ""
+    cc_min_payment: float = 0.0
 
 
 class _MockBankingStore:
@@ -212,6 +228,11 @@ class _MockBankingStore:
             tier="priority",
             balance=2143.87,
             open_tickets=2,
+            upi_limit=50000.0,
+            cc_limit=6000.0,
+            cc_balance_due=842.15,
+            cc_due_date=(datetime.now() + timedelta(days=12)).strftime("%Y-%m-%d"),
+            cc_min_payment=35.0,
         )
         now = datetime.now()
         self.transactions: list[Transaction] = [
@@ -255,11 +276,19 @@ _current_user_id: int | None = None
 
 def _build_user_store(user_id: int, full_name: str, date_of_birth: str) -> _MockBankingStore:
     account = banking_data.build_account(user_id)
+    # Deterministic base balance plus every transfer this account has ever
+    # sent/received (see storage.balance_adjustments) -- so a customer's
+    # balance is correct on every fresh load, in whichever process happens
+    # to hydrate them next, not just within the process that ran the transfer.
+    balance = account.balance + storage.get_balance_adjustments_total(user_id)
     store = _MockBankingStore.__new__(_MockBankingStore)
     store.customer = CustomerProfile(
         account_id=account.account_id, full_name=full_name, date_of_birth=date_of_birth,
-        tier=account.tier, balance=account.balance, open_tickets=account.open_tickets,
+        tier=account.tier, balance=balance, open_tickets=account.open_tickets,
         identity_verified=True,
+        upi_limit=account.upi_limit, cc_limit=account.cc_limit,
+        cc_balance_due=account.cc_balance_due, cc_due_date=account.cc_due_date,
+        cc_min_payment=account.cc_min_payment,
     )
     store.transactions = list(account.transactions)
     store.tickets = []
@@ -311,9 +340,32 @@ def verified_customer_note() -> str:
 @function_tool
 async def verify_identity(full_name: str, date_of_birth: str) -> str:
     """Verify the caller's identity before discussing account details or taking
-    action on the account. Call this first for any account-specific request."""
+    action on the account. Call this first for any account-specific request.
+    Do NOT call this if the caller is already shown as verified from account
+    login -- calling it again on an already-verified session is a no-op that
+    just confirms, it can never un-verify them."""
+    # A logged-in caller who arrived pre-verified (see set_current_user,
+    # hydrated from their signup identity) must never be knocked back to
+    # unverified by a redundant call here -- a mismatch below only means the
+    # name they happened to say out loud didn't string-match, not that
+    # they're not who the account login already proved they are.
+    if _current_user_id is not None and _store.customer.identity_verified:
+        result = f"Identity already verified for {_store.customer.full_name} from account login -- no need to re-verify."
+        await dashboard_bridge.broadcast_tool_call("verify_identity", {"full_name": full_name, "date_of_birth": date_of_birth}, result)
+        return result
+
     normalized_dob = _normalize_dob(date_of_birth)
     match = (full_name.strip().lower(), normalized_dob) in _VALID_IDENTITIES
+    if not match and _current_user_id is not None:
+        # Also accept a match against THIS caller's own signup-time identity,
+        # not just the fixed demo persona list -- otherwise any real signed-up
+        # user who isn't one of the 5 baked-in demo names can never verify.
+        on_file = storage.get_verified_identity(_current_user_id)
+        if on_file is not None:
+            match = (
+                full_name.strip().lower() == on_file.full_name.strip().lower()
+                and normalized_dob == on_file.date_of_birth
+            )
     _store.customer.identity_verified = match
     if match:
         # Reflect whichever teammate actually verified, instead of always
@@ -339,7 +391,8 @@ async def lookup_customer_profile() -> str:
     else:
         result = (
             f"Account {c.account_id} — {c.full_name}, tier={c.tier}, "
-            f"balance=${c.balance:,.2f}, open_tickets={c.open_tickets}"
+            f"balance=${c.balance:,.2f}, open_tickets={c.open_tickets}, "
+            f"card_frozen={c.card_frozen}"
         )
     await dashboard_bridge.broadcast_tool_call("lookup_customer_profile", {}, result)
     return result
@@ -358,19 +411,504 @@ async def check_recent_transactions() -> str:
 
 
 @function_tool
-async def process_refund(transaction_id: str, reason: str) -> str:
-    """Process a refund for a specific transaction ID once a duplicate or erroneous charge is confirmed."""
+async def check_credit_card_bill() -> str:
+    """Look up the caller's credit card bill: limit, current balance due, minimum payment, and due date."""
+    c = _store.customer
+    if not c.identity_verified:
+        result = "Cannot retrieve credit card bill: identity has not been verified yet. Call verify_identity first."
+    else:
+        result = (
+            f"Credit card — limit=${c.cc_limit:,.2f}, balance_due=${c.cc_balance_due:,.2f}, "
+            f"minimum_payment=${c.cc_min_payment:,.2f}, due_date={c.cc_due_date or 'n/a'}"
+        )
+    await dashboard_bridge.broadcast_tool_call("check_credit_card_bill", {}, result)
+    return result
+
+
+@function_tool
+async def block_card(reason: str) -> str:
+    """Freeze the caller's card (lost, stolen, or suspicious activity). Ask why before calling --
+    a real reason helps triage, but any stated reason is enough to freeze immediately since this
+    is protective and reversible, unlike a refund or transfer."""
+    c = _store.customer
+    if not c.identity_verified:
+        result = "Cannot block the card: identity has not been verified yet. Call verify_identity first."
+    elif c.card_frozen:
+        result = "Card is already frozen -- no action needed."
+    else:
+        c.card_frozen = True
+        ticket_id = _store.next_ticket_id()
+        _store.tickets.append({"ticket_id": ticket_id, "summary": f"Card frozen: {reason}", "priority": "high"})
+        c.open_tickets += 1
+        result = f"Card frozen (ticket {ticket_id}). No new charges can post until it's unfrozen or a replacement is issued."
+    await dashboard_bridge.broadcast_tool_call("block_card", {"reason": reason}, result)
+    return result
+
+
+@function_tool
+async def request_upi_limit_increase(new_limit: float) -> str:
+    """Request an increase to the caller's UPI transaction limit. Never applies instantly, same as a
+    refund -- opens a review ticket and tells the customer the standard turnaround."""
+    c = _store.customer
+    if not c.identity_verified:
+        result = "Cannot request a UPI limit increase: identity has not been verified yet. Call verify_identity first."
+    elif new_limit <= c.upi_limit:
+        result = f"Requested limit (${new_limit:,.2f}) is not higher than the current limit (${c.upi_limit:,.2f}) -- nothing to change."
+    else:
+        ticket_id = _store.next_ticket_id()
+        _store.tickets.append({
+            "ticket_id": ticket_id, "priority": "normal",
+            "summary": f"UPI limit increase request: ${c.upi_limit:,.2f} -> ${new_limit:,.2f}",
+        })
+        c.open_tickets += 1
+        result = (
+            f"Request {ticket_id} submitted to raise the UPI limit from ${c.upi_limit:,.2f} to "
+            f"${new_limit:,.2f}. This goes through standard review, not applied on this call -- "
+            f"tell the customer to expect a decision within 24-48 hours."
+        )
+    await dashboard_bridge.broadcast_tool_call("request_upi_limit_increase", {"new_limit": new_limit}, result)
+    return result
+
+
+# ─── Money transfer (registered customers only) ──────────────────────────────────
+# Two distinct confirmation gates, matching the refund flow's state-machine
+# shape rather than trusting the LLM to "be careful": find_contact resolves
+# and surfaces WHO the money would go to (gate 1 -- the agent reads this back
+# to the customer before doing anything else); initiate_transfer computes and
+# HOLDS a pending transfer without moving anything; confirm_transfer is the
+# only tool that can actually move money, and only on an explicit yes.
+
+_pending_transfers: dict[str, dict] = {}
+_transfer_seq = 500
+
+
+def _next_transfer_id() -> str:
+    global _transfer_seq
+    _transfer_seq += 1
+    return f"TRF-{_transfer_seq}"
+
+
+def _account_id_to_user_id(account_id: str) -> int | None:
+    """Account IDs are deterministically AC-{10000+user_id} (see
+    banking_data.build_account) -- this inverts cleanly with no extra lookup
+    table needed, as long as the account actually belongs to a real user."""
+    try:
+        candidate = int(account_id.strip().upper().removeprefix("AC-")) - 10000
+    except ValueError:
+        return None
+    return candidate if candidate > 0 else None
+
+
+@function_tool
+async def find_contact(name: str) -> str:
+    """Look up a registered AdaptiveCX customer by name before transferring money to them --
+    ALWAYS call this first for any transfer. Transfers can only go to another real customer with
+    an account here, never an arbitrary external payee. Read the result back to the customer to
+    confirm it's the right person before calling initiate_transfer; if more than one match comes
+    back, ask the customer which one (by account ID) rather than guessing."""
+    if not _store.customer.identity_verified:
+        result = "Cannot look up a contact: identity has not been verified yet. Call verify_identity first."
+        await dashboard_bridge.broadcast_tool_call("find_contact", {"name": name}, result)
+        return result
+
+    matches = storage.search_users_by_name(name, exclude_user_id=_current_user_id)
+    if not matches:
+        result = f"No registered AdaptiveCX customer found named '{name}'. Transfers can only be sent to another customer with an account here."
+    elif len(matches) == 1:
+        uid = matches[0]["user_id"]
+        account_id = banking_data.build_account(uid).account_id
+        result = f"Found: {matches[0]['display_name']}, account {account_id}. Confirm this is the right person with the customer before transferring."
+    else:
+        lines = []
+        for m in matches:
+            account_id = banking_data.build_account(m["user_id"]).account_id
+            lines.append(f"{m['display_name']} — account {account_id}")
+        result = (
+            f"Multiple customers named '{name}' found:\n" + "\n".join(lines) +
+            "\nAsk the customer which account (or more of the name) to narrow it down -- do not guess."
+        )
+    await dashboard_bridge.broadcast_tool_call("find_contact", {"name": name}, result)
+    return result
+
+
+@function_tool
+async def initiate_transfer(recipient_account_id: str, amount: float) -> str:
+    """Start a money transfer to a registered customer's account ID (from find_contact's result)
+    -- call find_contact first in every case. This only HOLDS the transfer; no money moves here.
+    Read the amount and recipient back to the customer and get an explicit yes/no, then call
+    confirm_transfer with their answer."""
+    if not _store.customer.identity_verified:
+        result = "Cannot start a transfer: identity has not been verified yet. Call verify_identity first."
+        await dashboard_bridge.broadcast_tool_call("initiate_transfer", {"recipient_account_id": recipient_account_id, "amount": amount}, result)
+        return result
+
+    if amount <= 0:
+        result = "Transfer amount must be greater than zero."
+    elif amount > _store.customer.balance:
+        result = f"Cannot transfer ${amount:,.2f} -- balance is only ${_store.customer.balance:,.2f}."
+    else:
+        recipient_user_id = _account_id_to_user_id(recipient_account_id)
+        recipient = storage.get_display_name(recipient_user_id) if recipient_user_id is not None else None
+        if recipient is None:
+            result = f"'{recipient_account_id}' isn't a registered customer account. Call find_contact to look up the right account ID first."
+        elif recipient_user_id == _current_user_id:
+            result = "Cannot transfer to your own account."
+        else:
+            transfer_id = _next_transfer_id()
+            _pending_transfers[transfer_id] = {
+                "sender_user_id": _current_user_id,
+                "recipient_user_id": recipient_user_id,
+                "recipient_name": recipient,
+                "recipient_account_id": recipient_account_id,
+                "amount": amount,
+            }
+            result = (
+                f"Transfer {transfer_id} ready: ${amount:,.2f} to {recipient} ({recipient_account_id}). "
+                f"NOT sent yet. Read this back to the customer and ask them to explicitly confirm "
+                f"yes or no, then call confirm_transfer with transfer_id='{transfer_id}' and their answer."
+            )
+    await dashboard_bridge.broadcast_tool_call("initiate_transfer", {"recipient_account_id": recipient_account_id, "amount": amount}, result)
+    return result
+
+
+@function_tool
+async def confirm_transfer(transfer_id: str, confirm: bool) -> str:
+    """Finish a transfer started by initiate_transfer. Only call this after the customer has
+    explicitly said yes or no out loud -- never assume. confirm=False cancels it, nothing moves.
+    confirm=True actually moves the money; this is the only tool that does."""
+    pending = _pending_transfers.get(transfer_id)
+    if pending is None:
+        result = f"No pending transfer found with ID {transfer_id} -- it may have already been completed or cancelled."
+    elif pending["sender_user_id"] != _current_user_id:
+        result = "That transfer doesn't belong to this caller."
+    elif not confirm:
+        del _pending_transfers[transfer_id]
+        result = f"Transfer {transfer_id} cancelled at the customer's request -- no money moved."
+    else:
+        amount = pending["amount"]
+        if amount > _store.customer.balance:
+            del _pending_transfers[transfer_id]
+            result = f"Cannot complete transfer {transfer_id} -- balance is now only ${_store.customer.balance:,.2f}."
+        else:
+            del _pending_transfers[transfer_id]
+            sender_id = pending["sender_user_id"]
+            recipient_id = pending["recipient_user_id"]
+            _store.customer.balance -= amount
+            storage.save_balance_adjustment(sender_id, -amount, reason=f"Transfer to {pending['recipient_name']}", counterparty_user_id=recipient_id, transfer_id=transfer_id)
+            storage.save_balance_adjustment(recipient_id, amount, reason=f"Transfer from {_store.customer.full_name}", counterparty_user_id=sender_id, transfer_id=transfer_id)
+            new_txn = Transaction(
+                transaction_id=transfer_id,
+                date=datetime.now().strftime("%Y-%m-%d"),
+                merchant=f"Transfer to {pending['recipient_name']}",
+                amount=amount, status="posted",
+            )
+            _store.transactions.insert(0, new_txn)
+            await dashboard_bridge.broadcast_new_transaction({
+                "transaction_id": new_txn.transaction_id, "date": new_txn.date,
+                "merchant": new_txn.merchant, "amount": new_txn.amount, "status": new_txn.status,
+            })
+            await dashboard_bridge.broadcast_balance_update(
+                _store.customer.balance, reason=f"Sent ${amount:,.2f} to {pending['recipient_name']}",
+            )
+            result = (
+                f"Transfer {transfer_id} complete: ${amount:,.2f} sent to {pending['recipient_name']} "
+                f"({pending['recipient_account_id']}). New balance: ${_store.customer.balance:,.2f}."
+            )
+    await dashboard_bridge.broadcast_tool_call("confirm_transfer", {"transfer_id": transfer_id, "confirm": confirm}, result)
+    return result
+
+
+_UNSET = object()
+
+
+async def _record_transaction_event(
+    txn: "Transaction", status: str, decided_by: str, note: str,
+    reason: str | None = None, user_id: int | None | object = _UNSET,
+) -> None:
+    """Single choke point for every transaction status change: updates the
+    in-memory record, persists it (logged-in callers only -- see storage.py)
+    so it survives after the call, and broadcasts it live so the dashboard's
+    Transactions panel updates in real time instead of only on next fetch.
+
+    user_id defaults to whichever caller is "current" right now, but accepts
+    an explicit override -- background review tasks (see
+    _schedule_review_decision) capture the user_id at dispute time rather
+    than reading the global at resolution time, since by the time a delayed
+    decision fires, a different call could in principle be "current" in this
+    same worker process.
+    """
+    uid = _current_user_id if user_id is _UNSET else user_id
+    txn.status = status
+    if reason is not None:
+        txn.dispute_reason = reason
+    if uid is not None:
+        storage.save_transaction_event(
+            uid, txn.transaction_id, status,
+            reason=reason if reason is not None else txn.dispute_reason,
+            decided_by=decided_by, note=note,
+        )
+    await dashboard_bridge.broadcast_transaction_update({
+        "transaction_id": txn.transaction_id,
+        "merchant": txn.merchant,
+        "amount": txn.amount,
+        "status": status,
+        "reason": reason if reason is not None else txn.dispute_reason,
+        "decided_by": decided_by,
+        "note": note,
+    })
+
+
+# Background review-decision tasks (see _schedule_review_decision) must be
+# held onto or asyncio will silently garbage-collect them mid-sleep.
+_bg_tasks: set = set()
+
+
+def _create_bg_task(coro):
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return task
+
+
+# How long a dispute stays visibly "under review" before a decision lands.
+# Real banks take 1-2 business days; this demo can't make you wait that long
+# to see the outcome, but it should never look instant either -- an agent
+# that can refund money the moment it's asked is the exact behavior this
+# whole review flow exists to prevent. A duplicate confirmed by matching it
+# against another charge on the account is closer to automated reconciliation
+# (fast); a decision resting on judgment of the customer's own wording is
+# modeled as a slower, real human review queue.
+FAST_REVIEW_SECONDS = 6.0
+SLOW_REVIEW_SECONDS = 18.0
+
+# Set once per turn by agent.py from the session's current BehaviorSignals
+# (mirrors set_escalation_authorized below) -- the ONLY place dispute/refund
+# decision logic is allowed to read the customer's current emotional state,
+# for the one policy rule that depends on it (see policy_faq.NEGATIVE_EMOTIONS
+# and its use in _schedule_review_decision).
+_current_emotion: str = "neutral"
+
+
+def set_current_emotion(emotion: str) -> None:
+    global _current_emotion
+    _current_emotion = emotion
+
+
+def _check_objective_duplicate(txn: "Transaction") -> str | None:
+    """Does this charge match another one on the account (same merchant +
+    amount, different transaction) that isn't already refunded? That's a
+    verifiable duplicate regardless of what the customer said."""
+    dupes = [
+        t for t in _store.transactions
+        if t.transaction_id != txn.transaction_id
+        and t.merchant == txn.merchant and t.amount == txn.amount
+        and t.status != "refunded"
+    ]
+    if not dupes:
+        return None
+    other = dupes[0]
+    return (
+        f"Matches {other.transaction_id} -- same merchant ({txn.merchant}) and amount "
+        f"(${txn.amount:.2f}) charged separately. Confirmed duplicate."
+    )
+
+
+def _check_filing_window(txn: "Transaction") -> str | None:
+    """Hard policy cutoff (policy_faq.DISPUTE_FILING_WINDOW_DAYS) -- returns a
+    denial note if the transaction is older than the window, else None. This
+    is a mechanical rule, not a judgment call, so it's checked first and
+    denies immediately rather than waiting on a review delay."""
+    try:
+        txn_date = datetime.strptime(txn.date, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    days_elapsed = (datetime.now().date() - txn_date).days
+    if days_elapsed > policy_faq.DISPUTE_FILING_WINDOW_DAYS:
+        return (
+            f"Transaction was {days_elapsed} day(s) ago, outside the "
+            f"{policy_faq.DISPUTE_FILING_WINDOW_DAYS}-day dispute filing window (policy POL-01). "
+            f"Disputes filed after the window are denied automatically, regardless of reason."
+        )
+    return None
+
+
+def _review_team_decide(txn: "Transaction", reason: str) -> tuple[str, str, float]:
+    """Decides approve/deny/pending, reading only from policy_faq.py -- no
+    thresholds or category rules live here, so what the agent tells a
+    customer about policy (see policy_faq.FAQ_ENTRIES, surfaced through
+    knowledge_base.py) can never drift from what this function actually
+    enforces. Returns (decision, note, delay_seconds).
+
+    1. Filing window (mechanical, checked by the caller before this runs).
+    2. Objective: an automated cross-check against the rest of the account
+       (see _check_objective_duplicate) -- if it matches, that alone approves
+       it, fast, like automated reconciliation would.
+    3. Otherwise, the customer's stated reason is matched against
+       policy_faq.DISPUTE_CATEGORIES. An eligible category is approved; the
+       merchant/satisfaction category is denied (valid charge, not a bank
+       error); no match goes to "pending" -- a real reviewer, not a guess.
+    """
+    dup_note = _check_objective_duplicate(txn)
+    if dup_note:
+        return "approved", dup_note, FAST_REVIEW_SECONDS
+
+    category = policy_faq.find_category(reason)
+    if category is None:
+        return "pending", (
+            "Reason doesn't clearly match a known dispute category and no matching duplicate "
+            "charge exists on the account -- held for a human reviewer rather than guessed."
+        ), 0.0
+    if not category.eligible:
+        return "denied", (
+            f"Category: {category.label}. {category.policy_note}"
+        ), SLOW_REVIEW_SECONDS
+    return "approved", (
+        f"Category: {category.label}. {category.policy_note or 'Approved per policy.'}"
+    ), SLOW_REVIEW_SECONDS
+
+
+def _maybe_authorize_escalation_on_denial() -> None:
+    """Policy (see policy_faq.NEGATIVE_EMOTIONS): a denial landing while the
+    customer is currently showing visible negative emotion authorizes
+    escalation immediately, bypassing the normal multi-turn dissatisfaction
+    streak -- a denial is the agent's own decision-making running out of
+    road, and an upset customer shouldn't just be told "no" and left there."""
+    if _current_emotion in policy_faq.NEGATIVE_EMOTIONS:
+        set_escalation_authorized(
+            True,
+            reason="A dispute was just denied while the customer was visibly upset -- "
+                   "policy authorizes escalation to a specialist for a final call.",
+        )
+
+
+def _schedule_review_decision(txn: "Transaction", decision: str, note: str, decided_by: str, delay: float, user_id) -> None:
+    """Applies an already-computed approve/deny decision after `delay`
+    seconds, so the Transactions panel genuinely shows "pending" for a while
+    before the outcome appears -- see FAST/SLOW_REVIEW_SECONDS above. Only
+    fires if the transaction is still sitting in disputed_under_review by
+    then (skips silently if something else already changed it)."""
+    async def _resolve():
+        await asyncio.sleep(delay)
+        if txn.status != "disputed_under_review":
+            return
+        status = "approved_for_refund" if decision == "approved" else "refund_denied"
+        if decision == "denied":
+            _maybe_authorize_escalation_on_denial()
+        await _record_transaction_event(txn, status, decided_by=decided_by, note=note, user_id=user_id)
+    _create_bg_task(_resolve())
+
+
+@function_tool
+async def dispute_transaction(transaction_id: str, reason: str) -> str:
+    """Open a dispute on a transaction the customer says is wrong (duplicate, wrong amount,
+    charge they don't recognize, etc). Always call this BEFORE process_refund -- a refund can
+    only be processed once a dispute has cleared review, which never happens instantly. Ask the
+    customer why they believe the charge is wrong and pass their real reason; do not invent one."""
+    if not _store.customer.identity_verified:
+        result = "Cannot open a dispute: identity has not been verified yet. Call verify_identity first."
+        await dashboard_bridge.broadcast_tool_call("dispute_transaction", {"transaction_id": transaction_id, "reason": reason}, result)
+        return result
+
     txn = next((t for t in _store.transactions if t.transaction_id == transaction_id), None)
     if txn is None:
         result = f"No transaction found with ID {transaction_id}."
     elif txn.status == "refunded":
-        result = f"Transaction {transaction_id} was already refunded."
+        result = f"Transaction {transaction_id} was already refunded -- nothing to dispute."
+    elif txn.status == "approved_for_refund":
+        result = f"Transaction {transaction_id} is already approved for refund. Call process_refund to finish it."
+    elif txn.status == "disputed_under_review":
+        result = f"Transaction {transaction_id} is already under review from an earlier dispute -- no need to open another, tell the customer it's still pending."
+    elif txn.status == "refund_denied":
+        result = f"Transaction {transaction_id} was already reviewed and the refund was denied. Offer to escalate if the customer disagrees."
+    elif len(reason.strip()) < 8:
+        result = "Need a real reason before a dispute can be opened -- ask the customer specifically why this charge is wrong (duplicate? wrong amount? they don't recognize it?) and call this again with that reason."
+    elif (window_note := _check_filing_window(txn)) is not None:
+        # Mechanical policy cutoff (policy_faq.DISPUTE_FILING_WINDOW_DAYS) --
+        # denied immediately, no review queue, regardless of category or
+        # reason. This is the one denial that can be instant: it isn't a
+        # judgment call, it's a fixed rule, so there's nothing to "review."
+        await _record_transaction_event(
+            txn, "refund_denied", decided_by="system", reason=reason, note=window_note,
+        )
+        _maybe_authorize_escalation_on_denial()
+        result = (
+            f"Dispute for {transaction_id} DENIED: {window_note} Tell the customer plainly that the "
+            f"filing window has passed, and offer to escalate if they disagree."
+        )
     else:
-        txn.status = "refunded"
-        refund_id = _store.next_refund_id()
-        _store.refunds.append({"refund_id": refund_id, "transaction_id": transaction_id, "amount": txn.amount, "reason": reason})
-        result = f"Refund {refund_id} of ${txn.amount:.2f} issued for {transaction_id}. Funds return in 3-5 business days."
-    await dashboard_bridge.broadcast_tool_call("process_refund", {"transaction_id": transaction_id, "reason": reason}, result)
+        # Every dispute -- even one matching a pre-existing fraud-monitoring
+        # flag -- opens as "under review" first. Nothing resolves inside this
+        # same tool call; a decision lands later via _schedule_review_decision
+        # and shows up in the Transactions panel's timeline, same as a real
+        # bank's review queue would, not an instant refund on request.
+        if txn.status == "duplicate_flagged":
+            decision, note, delay = "approved", (
+                "Pre-flagged by fraud monitoring as a probable duplicate before the customer even "
+                "called in -- confirming against the account now."
+            ), FAST_REVIEW_SECONDS
+        else:
+            decision, note, delay = _review_team_decide(txn, reason)
+
+        await _record_transaction_event(
+            txn, "disputed_under_review", decided_by="system", reason=reason,
+            note="Dispute received and queued for review." if decision != "pending" else note,
+        )
+        ticket_id = _store.next_ticket_id()
+        _store.tickets.append({
+            "ticket_id": ticket_id,
+            "summary": f"Dispute on {transaction_id} ({txn.merchant}, ${txn.amount:.2f}): {reason}",
+            "priority": "normal",
+        })
+        _store.customer.open_tickets += 1
+
+        if decision == "pending":
+            result = (
+                f"Dispute {ticket_id} opened for {transaction_id} -- {note} Tell the customer it'll "
+                f"be reviewed within 1-2 business days and it is NOT approved on this call."
+            )
+        else:
+            _schedule_review_decision(txn, decision, note, "system" if delay == FAST_REVIEW_SECONDS else "review_team", delay, _current_user_id)
+            eta = "shortly" if delay == FAST_REVIEW_SECONDS else "within a couple minutes"
+            result = (
+                f"Dispute {ticket_id} opened for {transaction_id} and sent for review -- it is under "
+                f"review right now, NOT approved yet. A decision will land {eta} and show up in the "
+                f"Transactions panel; do not tell the customer it's approved or that a refund is "
+                f"coming until you see that decision (call check_recent_transactions to check)."
+            )
+    await dashboard_bridge.broadcast_tool_call("dispute_transaction", {"transaction_id": transaction_id, "reason": reason}, result)
+    return result
+
+
+@function_tool
+async def process_refund(transaction_id: str) -> str:
+    """Actually move the money for a transaction that dispute_transaction has already cleared
+    (status approved_for_refund). Will refuse if no dispute was opened, the dispute is still
+    under review, or it was denied -- call dispute_transaction first in every case."""
+    if not _store.customer.identity_verified:
+        result = "Cannot process a refund: identity has not been verified yet. Call verify_identity first."
+    else:
+        txn = next((t for t in _store.transactions if t.transaction_id == transaction_id), None)
+        if txn is None:
+            result = f"No transaction found with ID {transaction_id}."
+        elif txn.status == "refunded":
+            result = f"Transaction {transaction_id} was already refunded."
+        elif txn.status != "approved_for_refund":
+            result = (
+                f"Cannot refund {transaction_id} yet -- status is '{txn.status}'. Call "
+                f"dispute_transaction first; it must be approved before a refund can be processed."
+            )
+        else:
+            refund_id = _store.next_refund_id()
+            _store.refunds.append({
+                "refund_id": refund_id, "transaction_id": transaction_id,
+                "amount": txn.amount, "reason": txn.dispute_reason,
+            })
+            await _record_transaction_event(
+                txn, "refunded", decided_by="system",
+                note=f"Refund {refund_id} of ${txn.amount:.2f} issued. Funds return in 3-5 business days.",
+            )
+            result = f"Refund {refund_id} of ${txn.amount:.2f} issued for {transaction_id}. Funds return in 3-5 business days."
+    await dashboard_bridge.broadcast_tool_call("process_refund", {"transaction_id": transaction_id}, result)
     return result
 
 
@@ -387,13 +925,41 @@ async def create_support_ticket(summary: str, priority: str = "normal") -> str:
 
 _MEETING_SLOTS = ["10:00 AM", "11:30 AM", "1:30 PM", "3:45 PM", "5:15 PM"]
 
+# Set once per turn by agent.py from the session's rolling dissatisfaction
+# signal (see _update_escalation_eligibility) -- keeps escalation reserved
+# for customers who are actually repeatedly unhappy, instead of the model
+# being able to hand every single query straight to a human. Defaults True
+# so a hard-coded high-severity call (e.g. fraud) from the agent's own
+# judgment during a guest/unscored context is never silently blocked.
+_escalation_authorized = True
+_escalation_gate_reason = ""
+
+
+def set_escalation_authorized(authorized: bool, reason: str = "") -> None:
+    global _escalation_authorized, _escalation_gate_reason
+    _escalation_authorized = authorized
+    _escalation_gate_reason = reason
+
 
 @function_tool
-async def escalate_to_specialist(summary: str, reason: str) -> str:
+async def escalate_to_specialist(summary: str, reason: str, transaction_id: str = "") -> str:
     """Escalate the caller to a live human specialist -- use this when the issue is
     outside what you can resolve on this call, or the customer is still unsatisfied
     after your best effort. Creates a priority ticket and books a callback meeting
-    with a real specialist, returning a meeting link and time the customer can join."""
+    with a real specialist, returning a meeting link and time the customer can join.
+    If this escalation is about a specific transaction (e.g. a denied refund the
+    customer disagrees with), pass its transaction_id so it's reflected there too."""
+    if not _escalation_authorized:
+        result = (
+            "Escalation not authorized yet -- this customer hasn't crossed the "
+            "dissatisfaction threshold for a human handoff. " + _escalation_gate_reason +
+            " Keep trying to resolve this yourself: acknowledge their frustration, "
+            "offer a concrete next step, and only try escalating again if they remain "
+            "unsatisfied after that."
+        )
+        await dashboard_bridge.broadcast_tool_call("escalate_to_specialist", {"summary": summary, "reason": reason}, result)
+        return result
+
     ticket_id = _store.next_ticket_id()
     _store.tickets.append({"ticket_id": ticket_id, "summary": summary, "priority": "high"})
     _store.customer.open_tickets += 1
@@ -404,9 +970,17 @@ async def escalate_to_specialist(summary: str, reason: str) -> str:
         f"Escalation ticket {ticket_id} created (reason: {reason}). A specialist is "
         f"booked to meet you on {meeting_day} at {slot}. Meeting link: {meeting_link}"
     )
+
+    txn = next((t for t in _store.transactions if t.transaction_id == transaction_id), None) if transaction_id else None
+    if txn is not None:
+        await _record_transaction_event(
+            txn, "escalated", decided_by="agent", reason=reason,
+            note=f"Escalated to a human specialist -- ticket {ticket_id}, meeting {meeting_day} at {slot}.",
+        )
+
     await dashboard_bridge.broadcast_tool_call(
         "escalate_to_specialist",
-        {"summary": summary, "reason": reason},
+        {"summary": summary, "reason": reason, "transaction_id": transaction_id},
         result,
     )
     return result
@@ -416,6 +990,13 @@ BANKING_TOOLS = [
     verify_identity,
     lookup_customer_profile,
     check_recent_transactions,
+    check_credit_card_bill,
+    block_card,
+    request_upi_limit_increase,
+    find_contact,
+    initiate_transfer,
+    confirm_transfer,
+    dispute_transaction,
     process_refund,
     create_support_ticket,
     escalate_to_specialist,

@@ -378,6 +378,38 @@ async def broadcast_voice_cx(result: dict):
     })
 
 
+async def broadcast_transaction_update(event: dict):
+    """Send one transaction status change (dispute opened, review decision,
+    refund issued, escalated, etc) to the dashboard's Transactions panel, live,
+    as it happens during the call -- not just visible after the fact via the
+    static /transactions history fetch."""
+    await broadcast({
+        "type": "transaction_update",
+        **event,
+    })
+
+
+async def broadcast_balance_update(balance: float, reason: str = ""):
+    """Push the caller's new account balance to the dashboard the instant it
+    changes (e.g. right after a money transfer completes) -- the Transactions
+    panel's balance line updates live instead of only on next open/refresh."""
+    await broadcast({
+        "type": "balance_update",
+        "balance": balance,
+        "reason": reason,
+    })
+
+
+async def broadcast_new_transaction(txn: dict):
+    """Push a brand-new transaction (e.g. an outgoing transfer) to the
+    dashboard's Transactions panel the instant it's created, so it appears
+    live without the customer needing to close and reopen the panel."""
+    await broadcast({
+        "type": "new_transaction",
+        **txn,
+    })
+
+
 async def broadcast_knowledge(knowledge: dict):
     """Send the knowledge-base retrieval result (or knowledge-gap flag) to the dashboard."""
     await broadcast({

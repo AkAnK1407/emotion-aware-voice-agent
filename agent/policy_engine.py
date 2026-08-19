@@ -76,6 +76,29 @@ POLICIES: Dict[str, Policy] = {
     ),
 }
 
+# Maps each policy to the Cartesia TTS `emotion` / `speed` controls
+# (livekit.plugins.cartesia.tts.TTSVoiceEmotion / TTSVoiceSpeed) so the
+# customer actually HEARS the tone shift, not just reads different wording.
+# Deliberately the agent's own supportive tone for each situation, not a
+# mirror of the customer's emotion (an agent that sounds angry back at an
+# angry customer would be a bug, not empathy). Applied live via
+# session.tts.update_options() in agent.py:on_user_turn_completed, once per
+# turn right after a policy is selected.
+POLICY_VOICE_EMOTION: Dict[str, list] = {
+    "HIGH_EMPATHY": ["Sympathetic", "Apologetic"],
+    "CALM":         ["Calm", "Sympathetic"],
+    "BALANCED":     ["Neutral"],
+    "EFFICIENT":    ["Content", "Confident"],
+    "ESCALATE":     ["Apologetic", "Calm"],
+}
+POLICY_VOICE_SPEED: Dict[str, str] = {
+    "HIGH_EMPATHY": "slow",
+    "CALM":         "slow",
+    "BALANCED":     "normal",
+    "EFFICIENT":    "fast",
+    "ESCALATE":     "slowest",
+}
+
 # Emotion fit scores per policy: how well does this policy suit each emotion?
 EMOTION_FIT: Dict[str, Dict[Emotion, float]] = {
     "HIGH_EMPATHY": {

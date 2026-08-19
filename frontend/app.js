@@ -11,17 +11,17 @@ console.log("window.LiveKit:", window.LiveKit);
 console.log("window.LivekitClient:", window.LivekitClient);
 console.log("typeof module:", typeof module !== 'undefined' ? module : 'undefined');
 console.log("typeof exports:", typeof exports !== 'undefined' ? exports : 'undefined');
-const LIVEKIT_URL = "wss://voice-agent-9u8rfie6.ohyderabad1a.production.livekit.cloud";
+const LIVEKIT_URL = "wss://voice-agent-2y77bxoc.livekit.cloud";
 
 // Backend (agent worker + dashboard WS + /token) hostname when not running
 // locally. Update this whenever you restart the Cloudflare Tunnel / redeploy
 // to Render — quick tunnels get a new random hostname each run.
-const BACKEND_HOST = "indicator-bracelets-ccd-average.trycloudflare.com";
+const BACKEND_HOST = "kernel-thereafter-counsel-softball.trycloudflare.com";
 
 // Login/signup/history API (auth_server.py) — separate service, separate
 // tunnel, since dashboard_bridge's server can't accept anything but a
 // bodyless GET. Same "update after restarting the tunnel" caveat as above.
-const AUTH_HOST = "reed-protecting-matthew-sacred.trycloudflare.com";
+const AUTH_HOST = "thats-medicines-managed-mid.trycloudflare.com";
 
 const IS_LOCAL = location.hostname === "localhost" || location.hostname === "127.0.0.1";
 const DASHBOARD_WS = IS_LOCAL ? "ws://localhost:8765" : `wss://${BACKEND_HOST}/`;
@@ -173,6 +173,11 @@ const transactionsPanel = document.getElementById("transactionsPanel");
 const transactionsBackdrop = document.getElementById("transactionsBackdrop");
 const transactionsBody = document.getElementById("transactionsBody");
 const transactionsCloseBtn = document.getElementById("transactionsCloseBtn");
+const contactsBtn = document.getElementById("contactsBtn");
+const contactsPanel = document.getElementById("contactsPanel");
+const contactsBackdrop = document.getElementById("contactsBackdrop");
+const contactsBody = document.getElementById("contactsBody");
+const contactsCloseBtn = document.getElementById("contactsCloseBtn");
 const historyCloseBtn = document.getElementById("historyCloseBtn");
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -524,6 +529,18 @@ function handleDashboardEvent(data) {
       handleToolCall(data);
       break;
 
+    case "transaction_update":
+      handleTransactionUpdate(data);
+      break;
+
+    case "new_transaction":
+      handleNewTransaction(data);
+      break;
+
+    case "balance_update":
+      handleBalanceUpdate(data);
+      break;
+
     case "guardrail":
       handleGuardrail(data);
       break;
@@ -679,12 +696,14 @@ function updateAccountUI() {
     accountName.style.display = "inline";
     historyBtn.style.display = "inline-flex";
     transactionsBtn.style.display = "inline-flex";
+    contactsBtn.style.display = "inline-flex";
     logoutBtn.style.display = "inline-flex";
     loginOpenBtn.style.display = "none";
   } else {
     accountName.style.display = "none";
     historyBtn.style.display = "none";
     transactionsBtn.style.display = "none";
+    contactsBtn.style.display = "none";
     logoutBtn.style.display = "none";
     loginOpenBtn.style.display = "inline-flex";
   }
@@ -786,8 +805,64 @@ function closeHistoryPanel() {
 }
 
 const TXN_STATUS_LABEL = {
-  posted: "Posted", duplicate_flagged: "⚠️ Duplicate flagged", refunded: "✅ Refunded",
+  posted: "Posted",
+  duplicate_flagged: "⚠️ Duplicate flagged",
+  disputed_under_review: "🔎 Under review",
+  approved_for_refund: "✅ Approved — refund pending",
+  refund_denied: "❌ Refund denied",
+  refunded: "✅ Refunded",
+  escalated: "📞 Escalated to specialist",
 };
+
+// Client-side cache so a "transaction_update" event arriving mid-call can
+// patch the panel live, even if it isn't open yet -- the next time the
+// customer opens it, it's already current instead of waiting on a re-fetch.
+let cachedTransactionsData = null;
+
+function handleTransactionUpdate(data) {
+  transactionsBtn.classList.add("has-update");
+  if (!cachedTransactionsData) return;
+  const t = cachedTransactionsData.transactions.find(x => x.transaction_id === data.transaction_id);
+  if (!t) return;
+  t.status = data.status;
+  t.reason = data.reason;
+  t.decided_by = data.decided_by;
+  t.note = data.note;
+  t.updated_at = Date.now() / 1000;
+  t.history = t.history || [];
+  t.history.push({
+    transaction_id: data.transaction_id, status: data.status, reason: data.reason,
+    decided_by: data.decided_by, note: data.note, created_at: Date.now() / 1000,
+  });
+  if (!transactionsPanel.classList.contains("hidden")) {
+    renderTransactions(cachedTransactionsData);
+  }
+}
+
+// A transfer creates a transaction the panel never had a snapshot of --
+// prepend it live instead of waiting for the customer to reopen the panel.
+function handleNewTransaction(data) {
+  transactionsBtn.classList.add("has-update");
+  if (!cachedTransactionsData) return;
+  cachedTransactionsData.transactions.unshift({
+    transaction_id: data.transaction_id, date: data.date, merchant: data.merchant,
+    amount: data.amount, status: data.status, history: [],
+  });
+  if (!transactionsPanel.classList.contains("hidden")) {
+    renderTransactions(cachedTransactionsData);
+  }
+}
+
+// The account balance line updates the instant it actually changes (e.g.
+// right after a transfer completes) instead of only on next open/refresh.
+function handleBalanceUpdate(data) {
+  transactionsBtn.classList.add("has-update");
+  if (!cachedTransactionsData) return;
+  cachedTransactionsData.balance = data.balance;
+  if (!transactionsPanel.classList.contains("hidden")) {
+    renderTransactions(cachedTransactionsData);
+  }
+}
 
 async function openTransactionsPanel() {
   if (!authSession) return;
@@ -800,6 +875,8 @@ async function openTransactionsPanel() {
     });
     if (!resp.ok) throw new Error("Could not load transactions.");
     const data = await resp.json();
+    cachedTransactionsData = data;
+    transactionsBtn.classList.remove("has-update");
     renderTransactions(data);
   } catch (err) {
     transactionsBody.innerHTML = `<div class="history-placeholder">${err.message}</div>`;
@@ -811,20 +888,49 @@ function closeTransactionsPanel() {
   transactionsBackdrop.classList.add("hidden");
 }
 
+const DECIDED_BY_LABEL = {
+  system: "🤖 Fraud monitoring (automatic)",
+  review_team: "🧑‍💼 Review team",
+  agent: "🎧 Your agent",
+  customer: "🗣️ You",
+};
+
 function renderTransactions(data) {
   const header = document.createElement("div");
   header.className = "history-room-divider";
-  header.textContent = `${data.account_id} · ${data.tier} tier · Balance $${data.balance.toFixed(2)}`;
+  const who = data.full_name ? `${data.full_name}${data.date_of_birth ? " · DOB " + data.date_of_birth : ""} — ` : "";
+  header.textContent = `${who}${data.account_id} · ${data.tier} tier · Balance $${data.balance.toFixed(2)}`;
   transactionsBody.innerHTML = "";
   transactionsBody.appendChild(header);
 
   for (const t of data.transactions) {
     const wrap = document.createElement("div");
     wrap.className = "history-turn agent";
+    const statusLabel = TXN_STATUS_LABEL[t.status] || t.status;
+    const decidedByLabel = t.decided_by ? (DECIDED_BY_LABEL[t.decided_by] || t.decided_by) : "";
+
+    let detailHtml = "";
+    if (t.reason || t.note) {
+      detailHtml += `<div class="h-detail">`;
+      if (t.reason) detailHtml += `<div class="h-detail-line"><b>Reason given:</b> ${t.reason}</div>`;
+      if (t.note) detailHtml += `<div class="h-detail-line"><b>Outcome:</b> ${t.note}</div>`;
+      if (decidedByLabel) detailHtml += `<div class="h-detail-line"><b>Decided by:</b> ${decidedByLabel}</div>`;
+      detailHtml += `</div>`;
+    }
+    if (t.history && t.history.length > 1) {
+      detailHtml += `<div class="h-detail h-timeline"><b>Timeline:</b><ul>`;
+      for (const ev of t.history) {
+        const time = new Date(ev.created_at * 1000).toLocaleTimeString();
+        detailHtml += `<li>${time} — ${TXN_STATUS_LABEL[ev.status] || ev.status}${ev.note ? " — " + ev.note : ""}</li>`;
+      }
+      detailHtml += `</ul></div>`;
+    }
+
     wrap.innerHTML = `
       <div class="h-speaker">${t.transaction_id}</div>
       <div class="h-text"></div>
-      <div class="h-time">${t.date} · $${t.amount.toFixed(2)} · ${TXN_STATUS_LABEL[t.status] || t.status}</div>
+      <div class="h-time">${t.date} · $${t.amount.toFixed(2)} · ${statusLabel}</div>
+      ${detailHtml}
     `;
     wrap.querySelector(".h-text").textContent = t.merchant;
     transactionsBody.appendChild(wrap);
@@ -834,6 +940,54 @@ function renderTransactions(data) {
   hint.className = "history-placeholder";
   hint.textContent = "Ask the agent about any of these on your call, e.g. \"what was that Amazon charge?\"";
   transactionsBody.appendChild(hint);
+}
+
+// ── Contacts panel (valid money-transfer recipients) ─────────────────────────
+// Every other registered customer -- the same set agent/tools.py:find_contact
+// searches on a call. Account ID is shown (not DOB) since another customer's
+// DOB has no reason to be visible here; see auth_server.py's /contacts.
+async function openContactsPanel() {
+  if (!authSession) return;
+  contactsPanel.classList.remove("hidden");
+  contactsBackdrop.classList.remove("hidden");
+  contactsBody.innerHTML = '<div class="history-placeholder">Loading…</div>';
+  try {
+    const resp = await fetch(AUTH_URL + "/contacts", {
+      headers: { "Authorization": "Bearer " + authSession.token },
+    });
+    if (!resp.ok) throw new Error("Could not load contacts.");
+    const data = await resp.json();
+    renderContacts(data.contacts);
+  } catch (err) {
+    contactsBody.innerHTML = `<div class="history-placeholder">${err.message}</div>`;
+  }
+}
+
+function closeContactsPanel() {
+  contactsPanel.classList.add("hidden");
+  contactsBackdrop.classList.add("hidden");
+}
+
+function renderContacts(contacts) {
+  contactsBody.innerHTML = "";
+  if (!contacts.length) {
+    contactsBody.innerHTML = '<div class="history-placeholder">No other registered customers yet.</div>';
+    return;
+  }
+  for (const c of contacts) {
+    const wrap = document.createElement("div");
+    wrap.className = "history-turn agent";
+    const dob = c.date_of_birth ? ` · DOB ${c.date_of_birth}` : "";
+    wrap.innerHTML = `
+      <div class="h-speaker">${c.display_name}</div>
+      <div class="h-time">${c.account_id}${dob}</div>
+    `;
+    contactsBody.appendChild(wrap);
+  }
+  const hint = document.createElement("div");
+  hint.className = "history-placeholder";
+  hint.textContent = "Transfers can only be sent to a registered customer shown here -- ask the agent, e.g. \"send $50 to Rahul.\"";
+  contactsBody.appendChild(hint);
 }
 
 function renderHistory(turns) {
@@ -1036,6 +1190,9 @@ historyBackdrop.addEventListener("click", closeHistoryPanel);
 transactionsBtn.addEventListener("click", openTransactionsPanel);
 transactionsCloseBtn.addEventListener("click", closeTransactionsPanel);
 transactionsBackdrop.addEventListener("click", closeTransactionsPanel);
+contactsBtn.addEventListener("click", openContactsPanel);
+contactsCloseBtn.addEventListener("click", closeContactsPanel);
+contactsBackdrop.addEventListener("click", closeContactsPanel);
 
 document.getElementById("voiceCxToggleBtn").addEventListener("click", () => {
   voiceCxEnabled = !voiceCxEnabled;

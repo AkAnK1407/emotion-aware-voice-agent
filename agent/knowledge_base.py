@@ -17,19 +17,9 @@ side (e.g. "how long does a dispute take") that isn't in the CRM.
 import re
 from dataclasses import dataclass
 
+import policy_faq
+
 FAQ_ENTRIES = [
-    {
-        "id": "FAQ-01",
-        "question": "How long does a duplicate transaction refund take?",
-        "answer": "Once a duplicate charge is confirmed, refunds are issued immediately and typically appear in the customer's account within 3-5 business days.",
-        "tags": ["duplicate", "refund", "transaction", "charge", "how long", "days"],
-    },
-    {
-        "id": "FAQ-02",
-        "question": "What is the process for disputing a transaction?",
-        "answer": "The agent verifies identity, reviews recent transactions for the disputed charge, and if it is confirmed as an error or duplicate, processes a refund and opens a ticket for the compliance record.",
-        "tags": ["dispute", "disagree", "wrong charge", "unauthorized", "process"],
-    },
     {
         "id": "FAQ-03",
         "question": "What should I do if I think my account was hacked?",
@@ -60,7 +50,7 @@ FAQ_ENTRIES = [
         "answer": "Voice support is available 24/7; specialist escalations for fraud and disputes are staffed 7am-11pm local time.",
         "tags": ["hours", "open", "available", "support hours", "when"],
     },
-]
+] + policy_faq.FAQ_ENTRIES
 
 _STOPWORDS = {
     "the", "a", "an", "is", "are", "was", "were", "i", "my", "me", "you", "your",

@@ -85,6 +85,33 @@ def init_db():
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_turns_user ON chat_turns(user_id, created_at)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS transaction_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                transaction_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT,
+                decided_by TEXT,
+                note TEXT,
+                created_at REAL NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_txn_events_user ON transaction_events(user_id, transaction_id, created_at)"
+        )
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS balance_adjustments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                delta REAL NOT NULL,
+                reason TEXT,
+                counterparty_user_id INTEGER,
+                transfer_id TEXT,
+                created_at REAL NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_balance_adj_user ON balance_adjustments(user_id)")
 
 
 # ─── Password hashing ────────────────────────────────────────────────────────────
@@ -210,3 +237,109 @@ def get_chat_history(user_id: int, limit: int = 200) -> list[dict]:
             (user_id, limit),
         ).fetchall()
     return [dict(r) for r in rows][::-1]  # oldest first
+
+
+# ─── Transaction dispute/refund/escalation events ────────────────────────────────
+# Written from inside a live call (agent/tools.py, its own subprocess) so a
+# dispute/review/refund/escalation decision survives after the call ends --
+# auth_server.py's /transactions endpoint reads these back and overlays them
+# on top of the deterministic base transaction list (banking_data.py) so the
+# dashboard's Transactions panel reflects what actually happened on a call,
+# not just the account's static starting state.
+
+def save_transaction_event(
+    user_id: int, transaction_id: str, status: str,
+    reason: Optional[str] = None, decided_by: Optional[str] = None, note: Optional[str] = None,
+):
+    with _connect() as conn:
+        conn.execute(
+            """INSERT INTO transaction_events
+               (user_id, transaction_id, status, reason, decided_by, note, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, transaction_id, status, reason, decided_by, note, time.time()),
+        )
+
+
+def get_transaction_status_overrides(user_id: int) -> dict[str, dict]:
+    """Latest event per transaction_id -- what the panel should show right now."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT transaction_id, status, reason, decided_by, note, created_at FROM transaction_events
+               WHERE user_id = ? AND id IN (
+                   SELECT MAX(id) FROM transaction_events WHERE user_id = ? GROUP BY transaction_id
+               )""",
+            (user_id, user_id),
+        ).fetchall()
+    return {r["transaction_id"]: dict(r) for r in rows}
+
+
+def search_users_by_name(query: str, exclude_user_id: Optional[int] = None) -> list[dict]:
+    """Case-insensitive substring match on display_name -- backs the
+    money-transfer flow's recipient lookup (agent/tools.py:find_contact).
+    Transfers only ever go to another real registered customer, never an
+    arbitrary external payee, so this table IS the contact list."""
+    like = f"%{query.strip().lower()}%"
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT id AS user_id, display_name FROM users WHERE lower(display_name) LIKE ? ORDER BY display_name",
+            (like,),
+        ).fetchall()
+    return [dict(r) for r in rows if exclude_user_id is None or r["user_id"] != exclude_user_id]
+
+
+def list_all_users(exclude_user_id: Optional[int] = None) -> list[dict]:
+    """Every registered customer -- backs the dashboard's Contacts panel."""
+    with _connect() as conn:
+        rows = conn.execute("SELECT id AS user_id, display_name FROM users ORDER BY display_name").fetchall()
+    return [dict(r) for r in rows if exclude_user_id is None or r["user_id"] != exclude_user_id]
+
+
+# ─── Balance ledger (money transfers) ─────────────────────────────────────────────
+# A transfer's sender and recipient are near-certainly two different users,
+# who in this architecture live in two different livekit-agents job
+# subprocesses (see agent.py's own docs -- one process per call) with no
+# shared memory. Neither side's in-memory _store can just be mutated
+# directly for the other party. This ledger is the one thing both sides
+# read: a customer's effective balance is always their deterministic base
+# balance (banking_data.build_account) plus the sum of every adjustment ever
+# recorded against their user_id, computed fresh wherever/whenever their
+# store is hydrated (see tools.py:_build_user_store).
+
+def save_balance_adjustment(
+    user_id: int, delta: float, reason: Optional[str] = None,
+    counterparty_user_id: Optional[int] = None, transfer_id: Optional[str] = None,
+):
+    with _connect() as conn:
+        conn.execute(
+            """INSERT INTO balance_adjustments
+               (user_id, delta, reason, counterparty_user_id, transfer_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (user_id, delta, reason, counterparty_user_id, transfer_id, time.time()),
+        )
+
+
+def get_balance_adjustments_total(user_id: int) -> float:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(delta), 0) AS total FROM balance_adjustments WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    return float(row["total"])
+
+
+def get_transaction_events(user_id: int, transaction_id: Optional[str] = None) -> list[dict]:
+    """Full timeline (oldest first) -- for a "what happened and when" history view."""
+    with _connect() as conn:
+        if transaction_id:
+            rows = conn.execute(
+                """SELECT transaction_id, status, reason, decided_by, note, created_at
+                   FROM transaction_events WHERE user_id = ? AND transaction_id = ? ORDER BY created_at ASC""",
+                (user_id, transaction_id),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT transaction_id, status, reason, decided_by, note, created_at
+                   FROM transaction_events WHERE user_id = ? ORDER BY created_at ASC""",
+                (user_id,),
+            ).fetchall()
+    return [dict(r) for r in rows]
